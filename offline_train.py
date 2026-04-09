@@ -7,7 +7,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from model import BATCH_SIZE, LR, SAVE_PATH, ActorCritic, bot_script, get_flat
+from model import BATCH_SIZE, IS_AVOIDING_INDEX, LR, SAVE_PATH, ActorCritic, bot_script, get_flat
+from runtime import load_compatible_state_dict
 
 
 def circular_loss(pred, target):
@@ -22,16 +23,14 @@ def load_checkpoint(model, device, save_path):
     try:
         ckpt = torch.load(save_path, map_location=device)
         if isinstance(ckpt, dict) and "model" in ckpt:
-            missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+            missing, unexpected, skipped = load_compatible_state_dict(model, ckpt["model"])
             resume_ep = ckpt.get("ep", 0)
             resume_steps = ckpt.get("total_steps", 0)
         else:
-            missing, unexpected = model.load_state_dict(ckpt, strict=False)
+            missing, unexpected, skipped = load_compatible_state_dict(model, ckpt)
         print(f"Resumed from {save_path} (ep={resume_ep} steps={resume_steps})")
-        if missing:
-            print(f"Missing checkpoint keys: {missing}")
-        if unexpected:
-            print(f"Unexpected checkpoint keys: {unexpected}")
+        if skipped:
+            print(f"Skipped incompatible keys: {skipped}")
     except FileNotFoundError:
         print(f"Starting fresh, no checkpoint at {save_path}")
     return resume_ep, resume_steps
@@ -88,16 +87,23 @@ def train_offline(args):
     batch_size = min(args.batch_size, n)
     total_steps = resume_steps
 
+    avoid_mask = sx[:, IS_AVOIDING_INDEX] > 0.5
+    n_avoid = int(avoid_mask.sum().item())
+    n_food  = n - n_avoid
     print(f"Device: {device}")
     print(f"Training focused supervised head on rows [{args.start}:{'end' if args.count is None else args.start + args.count})")
-    print(f"{'Epoch':>5}  {'loss':>8}  {'grad_norm':>10}  {'pred_std':>9}")
+    print(f"Avoid frames: {n_avoid}  Food frames: {n_food}")
+    print(f"{'Epoch':>5}  {'avoid_loss':>10}  {'food_loss':>9}  {'grad_norm':>10}  {'pred_std':>9}")
 
     for epoch in range(args.epochs):
         idx = torch.randperm(n, device=device)
-        epoch_loss = 0.0
-        grad_norm_sum = 0.0
-        pred_std_sum = 0.0
-        batches = 0
+        avoid_loss_sum = 0.0
+        food_loss_sum  = 0.0
+        avoid_batches  = 0
+        food_batches   = 0
+        grad_norm_sum  = 0.0
+        pred_std_sum   = 0.0
+        batches        = 0
 
         for start in range(0, n - batch_size + 1, batch_size):
             mb = idx[start:start + batch_size]
@@ -105,16 +111,25 @@ def train_offline(args):
             loss = circular_loss(pred, sy[mb])
             optimizer.zero_grad()
             loss.backward()
-            gn = nn.utils.clip_grad_norm_(model.focus_parameters(), 0.5)
+            gn = nn.utils.clip_grad_norm_(model.focus_parameters(), args.grad_clip)
             optimizer.step()
 
-            epoch_loss += loss.item()
-            grad_norm_sum += gn.item()
-            pred_std_sum += pred.detach().std().item()
-            batches += 1
-            total_steps += len(mb)
+            mb_avoid = avoid_mask[mb]
+            if mb_avoid.any():
+                avoid_loss_sum += circular_loss(pred[mb_avoid].detach(), sy[mb][mb_avoid]).item()
+                avoid_batches  += 1
+            if (~mb_avoid).any():
+                food_loss_sum  += circular_loss(pred[~mb_avoid].detach(), sy[mb][~mb_avoid]).item()
+                food_batches   += 1
 
-        print(f"{epoch + 1:>5}  {epoch_loss / batches:>8.4f}  {grad_norm_sum / batches:>10.4f}  {pred_std_sum / batches:>9.4f}")
+            grad_norm_sum += gn.item()
+            pred_std_sum  += pred.detach().std().item()
+            batches       += 1
+            total_steps   += len(mb)
+
+        avoid_loss_str = f"{avoid_loss_sum / avoid_batches:>10.4f}" if avoid_batches else f"{'n/a':>10}"
+        food_loss_str  = f"{food_loss_sum  / food_batches:>9.4f}"  if food_batches  else f"{'n/a':>9}"
+        print(f"{epoch + 1:>5}  {avoid_loss_str}  {food_loss_str}  {grad_norm_sum / batches:>10.4f}  {pred_std_sum / batches:>9.4f}", flush=True)
 
     torch.save(
         {"model": model.state_dict(), "ep": resume_ep, "total_steps": total_steps},
@@ -131,6 +146,7 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=20, help="Training epochs over the selected slice")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Mini-batch size")
     parser.add_argument("--lr", type=float, default=LR, help="Learning rate")
+    parser.add_argument("--grad-clip", type=float, default=2.0, help="Gradient clip norm (default 2.0)")
     parser.add_argument("--save-path", default=SAVE_PATH, help="Checkpoint file to update")
     return parser.parse_args()
 

@@ -102,10 +102,12 @@ class ActorCritic(nn.Module):
         # torch.where in dir_focus_logits routes gradients to the right head automatically.
         self.avoid_focus = nn.Sequential(
             nn.Linear(AVOID_FOCUS_IN, 16), nn.Tanh(),
+            nn.Linear(16, 16), nn.Tanh(),
             nn.Linear(16, 1),
         )
         self.food_focus = nn.Sequential(
             nn.Linear(FOOD_FOCUS_IN, 32), nn.Tanh(),
+            nn.Linear(32, 32), nn.Tanh(),
             nn.Linear(32, 1),
         )
         self.dir_residual = nn.Linear(128, 1)
