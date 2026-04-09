@@ -1,0 +1,10 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.jsonl
+*.pt
+old_models/
+old_train/
+scratch.py
+.codex
