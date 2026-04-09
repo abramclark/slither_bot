@@ -71,7 +71,7 @@ def load_states(path, start, count):
 def train_offline(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = ActorCritic().to(device)
-    resume_ep, resume_steps = load_checkpoint(model, device, args.save_path)
+    resume_ep, resume_steps = load_checkpoint(model, device, args.model_path)
 
     if args.reset_focus:
         for m in [model.avoid_focus, model.food_focus]:
@@ -140,9 +140,9 @@ def train_offline(args):
 
     torch.save(
         {"model": model.state_dict(), "ep": resume_ep, "total_steps": total_steps},
-        args.save_path,
+        args.model_path,
     )
-    print(f"Saved {args.save_path}")
+    print(f"Saved {args.model_path}")
 
 
 def parse_args():
@@ -155,7 +155,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=LR, help="Learning rate")
     parser.add_argument("--grad-clip", type=float, default=2.0, help="Gradient clip norm (default 2.0)")
     parser.add_argument("--reset-focus", action="store_true", help="Re-initialize focus head weights before training")
-    parser.add_argument("--save-path", default=SAVE_PATH, help="Checkpoint file to update")
+    parser.add_argument("--model-path", default=SAVE_PATH, help="Checkpoint file to load from and save to")
     return parser.parse_args()
 
 
