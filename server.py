@@ -143,7 +143,7 @@ if __name__ == "__main__":
         cmd = [sys.executable, __file__, "--no-reload"]
         proc = subprocess.Popen(cmd)
         try:
-            for _ in watch(__file__, "train.py", "model.py"):
+            for _ in watch(__file__, "model.py", "runtime.py"):
                 print("File changed — restarting...")
                 proc.terminate()
                 try:
