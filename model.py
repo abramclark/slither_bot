@@ -305,7 +305,7 @@ class SupervisedTrainer:
                 loss = (angle_err ** 2).mean()
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                nn.utils.clip_grad_norm_(self.model.focus_parameters(), 2.0)
                 self.optimizer.step()
                 total_loss += loss.item()
                 num_batches += 1
