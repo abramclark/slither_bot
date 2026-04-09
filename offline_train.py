@@ -81,7 +81,9 @@ def train_offline(args):
     sx = torch.from_numpy(states).to(device)
     sy = torch.from_numpy(targets).to(device)
 
-    optimizer = torch.optim.Adam(model.dir_focus.parameters(), lr=args.lr)
+    optimizer = torch.optim.Adam(
+        list(model.avoid_focus.parameters()) + list(model.food_focus.parameters()), lr=args.lr
+    )
     model.train()
 
     n = len(states)

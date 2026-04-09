@@ -75,6 +75,17 @@ AVOID_ANGLE_INDEX = 35
 AVOID_DIST_INDEX = 36
 IS_AVOIDING_INDEX = IN_DIM
 
+AVOID_FOCUS_IN = 3               # heading + avoid_angle + avoid_dist
+FOOD_FOCUS_IN  = 1 + K_FOOD * 3  # heading + K_FOOD food triplets
+
+
+def avoid_focus_features(x):
+    return x[..., [HEADING_INDEX, AVOID_ANGLE_INDEX, AVOID_DIST_INDEX]]
+
+
+def food_focus_features(x):
+    return torch.cat([x[..., [HEADING_INDEX]], x[..., FOOD_START_INDEX:FOOD_END_INDEX]], dim=-1)
+
 
 class ActorCritic(nn.Module):
     def __init__(self):
@@ -85,10 +96,16 @@ class ActorCritic(nn.Module):
             nn.Linear(128, 128), nn.Tanh(),
             nn.Linear(128, 128), nn.Tanh(),
         )
-        # Keep the full trunk for RL, but give supervised learning a direct path
-        # through the high-signal scripted-policy features.
-        self.dir_focus = nn.Sequential(
-            nn.Linear(34, 32), nn.Tanh(),
+        # Two focused supervised heads — one per behavior mode.
+        # avoid_focus trains only on is_avoiding=True frames (heading + snake geometry).
+        # food_focus trains only on is_avoiding=False frames (heading + food features).
+        # torch.where in dir_focus_logits routes gradients to the right head automatically.
+        self.avoid_focus = nn.Sequential(
+            nn.Linear(AVOID_FOCUS_IN, 16), nn.Tanh(),
+            nn.Linear(16, 1),
+        )
+        self.food_focus = nn.Sequential(
+            nn.Linear(FOOD_FOCUS_IN, 32), nn.Tanh(),
             nn.Linear(32, 1),
         )
         self.dir_residual = nn.Linear(128, 1)
@@ -105,7 +122,10 @@ class ActorCritic(nn.Module):
         return dir_mean, self.boost_head(h), self.value_head(h).squeeze(-1)
 
     def dir_focus_logits(self, x):
-        return self.dir_focus(supervised_focus_features(x))
+        is_avoiding = x[..., IS_AVOIDING_INDEX:IS_AVOIDING_INDEX + 1] > 0.5
+        return torch.where(is_avoiding,
+                           self.avoid_focus(avoid_focus_features(x)),
+                           self.food_focus(food_focus_features(x)))
 
     def dir_logits(self, x, h=None):
         if h is None:
@@ -234,7 +254,9 @@ class SupervisedTrainer:
     def __init__(self, model: ActorCritic, device):
         self.model = model
         self.device = device
-        self.optimizer = torch.optim.Adam(self.model.dir_focus.parameters(), lr=LR)
+        self.optimizer = torch.optim.Adam(
+            list(model.avoid_focus.parameters()) + list(model.food_focus.parameters()), lr=LR
+        )
         self.lock = threading.Lock()
         self.ep = 0
         self.total_steps = 0
@@ -259,6 +281,8 @@ class SupervisedTrainer:
         idxs = np.random.choice(buf_size, BATCH_SIZE, replace=False)
         states = torch.from_numpy(np.array([self._replay_states[i] for i in idxs], dtype=np.float32)).to(self.device)
         tds = torch.tensor([self._replay_dirs[i] for i in idxs], dtype=torch.float32).to(self.device)
+        n_avoid = int((states[:, IS_AVOIDING_INDEX] > 0.5).sum().item())
+        n_food = BATCH_SIZE - n_avoid
         total_loss = 0.0
         num_batches = 0
         for _ in range(SL_EPOCHS):
@@ -274,12 +298,14 @@ class SupervisedTrainer:
                 total_loss += loss.item()
                 num_batches += 1
         avg = total_loss / num_batches
-        print(f"[SL] steps={self.total_steps} buf={buf_size} avg_loss={avg:.4f}")
+        print(f"[SL] steps={self.total_steps} buf={buf_size} avg_loss={avg:.4f} avoid={n_avoid} food={n_food}")
         torch.save({"model": self.model.state_dict(), "ep": self.ep, "total_steps": self.total_steps}, SAVE_PATH)
 
     def reset_optimizer(self):
         with self.lock:
-            self.optimizer = torch.optim.Adam(self.model.dir_focus.parameters(), lr=LR)
+            self.optimizer = torch.optim.Adam(
+                list(self.model.avoid_focus.parameters()) + list(self.model.food_focus.parameters()), lr=LR
+            )
             print("[SL] optimizer reset")
 
     def finish_episode(self):
@@ -343,14 +369,3 @@ def bot_script(state_d):
 def get_flat(d):
     own_size, food, own_meta, own_body, snakes_meta, snakes_body, _, _ = parse_record(d)
     return make_flat_input(food, own_meta, own_body, snakes_meta, snakes_body)
-
-
-def supervised_focus_features(x):
-    return torch.cat(
-        (
-            x[..., [HEADING_INDEX]],
-            x[..., FOOD_START_INDEX:FOOD_END_INDEX],
-            x[..., [AVOID_ANGLE_INDEX, AVOID_DIST_INDEX, IS_AVOIDING_INDEX]],
-        ),
-        dim=-1,
-    )
