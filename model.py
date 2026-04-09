@@ -115,7 +115,7 @@ class ActorCritic(nn.Module):
             nn.Linear(32, 1),
         )
         self.dir_residual = nn.Linear(128, 1)
-        self.dir_log_std = nn.Parameter(torch.zeros(1))
+        self.dir_log_std = nn.Parameter(torch.full((1,), -2.0))  # std ≈ 0.14 initial exploration
         self.boost_head = nn.Linear(128, 2)
         self.value_head = nn.Linear(128, 1)
         nn.init.zeros_(self.dir_residual.weight)

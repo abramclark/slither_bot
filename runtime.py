@@ -117,7 +117,8 @@ class Session:
             reward = (state_d[0] - self.prev_size) * 10 if self.prev_size is not None else 0.0
             self.prev_size = state_d[0]
             x = get_flat(state_d)
-            x_aug = np.append(x, 0.0).astype(np.float32)
+            _, _, is_avoiding = bot_script(state_d)
+            x_aug = np.append(x, float(is_avoiding)).astype(np.float32)
             x_t = torch.from_numpy(x_aug).unsqueeze(0).to(self.runtime.device)
             with torch.no_grad():
                 direction, boost, log_prob, value = self.runtime.model.act(x_t)
