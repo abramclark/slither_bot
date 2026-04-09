@@ -135,6 +135,9 @@ class ActorCritic(nn.Module):
     def supervised_dir(self, x):
         return torch.tanh(self.dir_focus_logits(x)).squeeze(-1)
 
+    def focus_parameters(self):
+        return list(self.avoid_focus.parameters()) + list(self.food_focus.parameters())
+
     def act(self, x):
         dir_mean, boost_logits, value = self(x)
         dir_std = self.dir_log_std.clamp(-4, 2).exp()
@@ -254,9 +257,7 @@ class SupervisedTrainer:
     def __init__(self, model: ActorCritic, device):
         self.model = model
         self.device = device
-        self.optimizer = torch.optim.Adam(
-            list(model.avoid_focus.parameters()) + list(model.food_focus.parameters()), lr=LR
-        )
+        self.optimizer = torch.optim.Adam(model.focus_parameters(), lr=LR)
         self.lock = threading.Lock()
         self.ep = 0
         self.total_steps = 0
@@ -303,9 +304,7 @@ class SupervisedTrainer:
 
     def reset_optimizer(self):
         with self.lock:
-            self.optimizer = torch.optim.Adam(
-                list(self.model.avoid_focus.parameters()) + list(self.model.food_focus.parameters()), lr=LR
-            )
+            self.optimizer = torch.optim.Adam(self.model.focus_parameters(), lr=LR)
             print("[SL] optimizer reset")
 
     def finish_episode(self):
