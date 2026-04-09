@@ -26,12 +26,16 @@ def parse_record(d):
 
 
 def make_flat_input(food, own_meta, own_body, snakes_meta, snakes_body):
-    # top-K nearest food sorted by distance (col 2)
+    # Mirror bot_script exactly: top-K by size, filter too-close food, sort by dist/size.
+    # This guarantees the target angle is always at food_flat[1] (or heading if no valid food).
     food_flat = np.zeros(K_FOOD * 3, dtype=np.float32)
     if len(food) > 0:
+        snake_scale = own_meta[3]
         big_food = food[food[:, 0].argsort()][-K_FOOD:]
-        big_food = big_food[big_food[:, 2].argsort()]
-        food_flat[:len(big_food) * 3] = big_food.flatten()
+        valid = big_food[big_food[:, 2] > 50 * snake_scale]
+        if len(valid) > 0:
+            valid = valid[(valid[:, 2] / valid[:, 0]).argsort()]
+            food_flat[:len(valid) * 3] = valid.flatten()
 
     smallest_dists = np.array([s[:, 1].min() for s in snakes_body])
     nearest_ixs = smallest_dists.argsort()[:K_SNAKE]
@@ -125,9 +129,14 @@ class ActorCritic(nn.Module):
 
     def dir_focus_logits(self, x):
         is_avoiding = x[..., IS_AVOIDING_INDEX:IS_AVOIDING_INDEX + 1] > 0.5
+        food_feat = food_focus_features(x)
+        # Shortcut: add best-food's angle directly so the model starts predicting
+        # the right target on day 0; food_focus learns the residual correction.
+        # food_feat[..., 2] = food_flat[1] = angle of best-ratio food item.
+        food_logit = self.food_focus(food_feat) + food_feat[..., 2:3]
         return torch.where(is_avoiding,
                            self.avoid_focus(avoid_focus_features(x)),
-                           self.food_focus(food_focus_features(x)))
+                           food_logit)
 
     def dir_logits(self, x, h=None):
         if h is None:

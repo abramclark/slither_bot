@@ -73,6 +73,13 @@ def train_offline(args):
     model = ActorCritic().to(device)
     resume_ep, resume_steps = load_checkpoint(model, device, args.save_path)
 
+    if args.reset_focus:
+        for m in [model.avoid_focus, model.food_focus]:
+            for layer in m:
+                if hasattr(layer, 'reset_parameters'):
+                    layer.reset_parameters()
+        print("Focus heads reset to fresh weights")
+
     states, targets, seen_rows, used_rows = load_states(args.path, args.start, args.count)
     print(f"Scanned rows: {seen_rows}")
     print(f"Usable supervised frames: {used_rows}")
@@ -147,6 +154,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Mini-batch size")
     parser.add_argument("--lr", type=float, default=LR, help="Learning rate")
     parser.add_argument("--grad-clip", type=float, default=2.0, help="Gradient clip norm (default 2.0)")
+    parser.add_argument("--reset-focus", action="store_true", help="Re-initialize focus head weights before training")
     parser.add_argument("--save-path", default=SAVE_PATH, help="Checkpoint file to update")
     return parser.parse_args()
 
