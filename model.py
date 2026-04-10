@@ -140,13 +140,14 @@ class ActorCritic(nn.Module):
     def dir_focus_logits(self, x):
         is_avoiding = x[..., IS_AVOIDING_INDEX:IS_AVOIDING_INDEX + 1] > 0.5
         food_feat = food_focus_features(x)
-        # Shortcut: add best-food's angle directly so the model starts predicting
-        # the right target on day 0; food_focus learns the residual correction.
-        # food_feat[..., 2] = food_flat[1] = angle of best-ratio food item.
+        # Food shortcut: target ≈ food_flat[1] (best-ratio food angle).
         food_logit = self.food_focus(food_feat) + food_feat[..., 2:3]
-        return torch.where(is_avoiding,
-                           self.avoid_focus(avoid_focus_features(x)),
-                           food_logit)
+        avoid_feat = avoid_focus_features(x)
+        # Avoid shortcut: target = circ(avoid_angle - 1) ≈ -avoid_angle in sign,
+        # so -avoid_feat[1] gives the right sign from day 0 and breaks the symmetric
+        # saddle point that causes gradient cancellation at constant prediction.
+        avoid_logit = self.avoid_focus(avoid_feat) - avoid_feat[..., 1:2]
+        return torch.where(is_avoiding, avoid_logit, food_logit)
 
     def dir_logits(self, x, h=None):
         if h is None:
