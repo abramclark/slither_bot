@@ -114,18 +114,28 @@ class ActorCritic(nn.Module):
             nn.Linear(32, 32), nn.Tanh(),
             nn.Linear(32, 1),
         )
+        self.boost_focus = nn.Sequential(
+            nn.Linear(AVOID_FOCUS_IN, 16), nn.Tanh(),
+            nn.Linear(16, 16), nn.Tanh(),
+            nn.Linear(16, 2),
+        )
         self.dir_residual = nn.Linear(128, 1)
         self.dir_log_std = nn.Parameter(torch.full((1,), -2.0))  # std ≈ 0.14 initial exploration
         self.boost_head = nn.Linear(128, 2)
         self.value_head = nn.Linear(128, 1)
         nn.init.zeros_(self.dir_residual.weight)
         nn.init.zeros_(self.dir_residual.bias)
+        nn.init.zeros_(self.boost_head.weight)
+        nn.init.zeros_(self.boost_head.bias)
 
     def forward(self, x):
         h = self.shared(x)
         dir_logits = self.dir_logits(x, h)
         dir_mean = torch.tanh(dir_logits).squeeze(-1)
-        return dir_mean, self.boost_head(h), self.value_head(h).squeeze(-1)
+        return dir_mean, self.boost_head(h) + self.boost_focus_logits(x), self.value_head(h).squeeze(-1)
+
+    def boost_focus_logits(self, x):
+        return self.boost_focus(avoid_focus_features(x))
 
     def dir_focus_logits(self, x):
         is_avoiding = x[..., IS_AVOIDING_INDEX:IS_AVOIDING_INDEX + 1] > 0.5
@@ -147,7 +157,9 @@ class ActorCritic(nn.Module):
         return torch.tanh(self.dir_focus_logits(x)).squeeze(-1)
 
     def focus_parameters(self):
-        return list(self.avoid_focus.parameters()) + list(self.food_focus.parameters())
+        return (list(self.avoid_focus.parameters()) +
+                list(self.food_focus.parameters()) +
+                list(self.boost_focus.parameters()))
 
     def act(self, x):
         dir_mean, boost_logits, value = self(x)
@@ -275,12 +287,14 @@ class SupervisedTrainer:
         self._ep_steps = 0
         self._replay_states = collections.deque(maxlen=REPLAY_SIZE)
         self._replay_dirs = collections.deque(maxlen=REPLAY_SIZE)
+        self._replay_boosts = collections.deque(maxlen=REPLAY_SIZE)
         self._since_update = 0
 
-    def step(self, state, target_dir):
+    def step(self, state, target_dir, target_boost):
         with self.lock:
             self._replay_states.append(state)
             self._replay_dirs.append(float(target_dir))
+            self._replay_boosts.append(int(target_boost))
             self.total_steps += 1
             self._ep_steps += 1
             self._since_update += 1
@@ -293,6 +307,7 @@ class SupervisedTrainer:
         idxs = np.random.choice(buf_size, BATCH_SIZE, replace=False)
         states = torch.from_numpy(np.array([self._replay_states[i] for i in idxs], dtype=np.float32)).to(self.device)
         tds = torch.tensor([self._replay_dirs[i] for i in idxs], dtype=torch.float32).to(self.device)
+        tbs = torch.tensor([self._replay_boosts[i] for i in idxs], dtype=torch.long).to(self.device)
         n_avoid = int((states[:, IS_AVOIDING_INDEX] > 0.5).sum().item())
         n_food = BATCH_SIZE - n_avoid
         total_loss = 0.0
@@ -303,6 +318,10 @@ class SupervisedTrainer:
                 angle_err = (dir_mean - tds[mb]) % 2
                 angle_err = torch.where(angle_err > 1, angle_err - 2, angle_err)
                 loss = (angle_err ** 2).mean()
+                avoid_mb = states[mb, IS_AVOIDING_INDEX] > 0.5
+                if avoid_mb.any():
+                    boost_logits = self.model.boost_focus_logits(states[mb][avoid_mb])
+                    loss = loss + F.cross_entropy(boost_logits, tbs[mb][avoid_mb])
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.focus_parameters(), 2.0)

@@ -129,7 +129,7 @@ class Session:
         x = get_flat(state_d)
         target_dir, target_boost, is_avoiding = bot_script(state_d)
         x_aug = np.append(x, float(is_avoiding)).astype(np.float32)
-        self.runtime.sl_trainer.step(x_aug, target_dir)
+        self.runtime.sl_trainer.step(x_aug, target_dir, target_boost)
         self.episode_steps += 1
         return [target_dir, target_boost, time() * 1000]
 
