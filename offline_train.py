@@ -76,6 +76,13 @@ def train_offline(args):
     model = ActorCritic().to(device)
     resume_ep, resume_steps = load_checkpoint(model, device, args.model_path)
 
+    if args.zero_residuals:
+        nn.init.zeros_(model.dir_residual.weight)
+        nn.init.zeros_(model.dir_residual.bias)
+        nn.init.zeros_(model.boost_head.weight)
+        nn.init.zeros_(model.boost_head.bias)
+        print("PPO residual heads zeroed")
+
     if args.reset_focus:
         for m in [model.avoid_focus, model.food_focus, model.boost_focus]:
             for layer in m:
@@ -122,10 +129,8 @@ def train_offline(args):
             mb = idx[start:start + batch_size]
             mb_avoid = avoid_mask[mb]
             pred = model.supervised_dir(sx[mb])
-            loss = circular_loss(pred, sy[mb])
-            if mb_avoid.any():
-                boost_logits = model.boost_focus_logits(sx[mb][mb_avoid])
-                loss = loss + F.cross_entropy(boost_logits, sb[mb][mb_avoid])
+            boost_logits = model.boost_focus_logits(sx[mb])
+            loss = circular_loss(pred, sy[mb]) + F.cross_entropy(boost_logits, sb[mb])
             optimizer.zero_grad()
             loss.backward()
             gn = nn.utils.clip_grad_norm_(model.focus_parameters(), args.grad_clip)
@@ -134,11 +139,11 @@ def train_offline(args):
             if mb_avoid.any():
                 avoid_loss_sum += circular_loss(pred[mb_avoid].detach(), sy[mb][mb_avoid]).item()
                 avoid_batches  += 1
-                boost_loss_sum += F.cross_entropy(model.boost_focus_logits(sx[mb][mb_avoid]).detach(), sb[mb][mb_avoid]).item()
-                boost_batches  += 1
             if (~mb_avoid).any():
                 food_loss_sum  += circular_loss(pred[~mb_avoid].detach(), sy[mb][~mb_avoid]).item()
                 food_batches   += 1
+            boost_loss_sum += F.cross_entropy(model.boost_focus_logits(sx[mb]).detach(), sb[mb]).item()
+            boost_batches  += 1
 
             grad_norm_sum += gn.item()
             pred_std_sum  += pred.detach().std().item()
@@ -167,6 +172,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=LR, help="Learning rate")
     parser.add_argument("--grad-clip", type=float, default=2.0, help="Gradient clip norm (default 2.0)")
     parser.add_argument("--reset-focus", action="store_true", help="Re-initialize focus head weights before training")
+    parser.add_argument("--zero-residuals", action="store_true", help="Zero dir_residual and boost_head (PPO-trained) before training")
     parser.add_argument("--model-path", default=SAVE_PATH, help="Checkpoint file to load from and save to")
     return parser.parse_args()
 

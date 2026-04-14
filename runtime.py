@@ -6,6 +6,7 @@ import torch
 from model import (
     AVOID_DIST,
     BATCH_SIZE,
+    PPO_BATCH,
     LR,
     MINI_BATCH,
     SAVE_PATH,
@@ -37,7 +38,7 @@ def load_compatible_state_dict(model, state_dict):
 
 class Runtime:
     def __init__(self):
-        self.training_mode = "supervised"
+        self.training_mode = "ppo"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = ActorCritic().to(self.device)
         self.resume_ep = 0
@@ -83,6 +84,7 @@ class Runtime:
             "TRAINING_MODE": self.training_mode,
             "LR": LR,
             "BATCH_SIZE": BATCH_SIZE,
+            "PPO_BATCH": PPO_BATCH,
             "MINI_BATCH": MINI_BATCH,
         }
 
@@ -91,7 +93,7 @@ class Runtime:
             with self.trainer.lock:
                 n = min(10, episode_steps, len(self.trainer.rewards))
                 for i in range(-n, 0):
-                    self.trainer.rewards[i] = -10
+                    self.trainer.rewards[i] = -20
                 if n > 0:
                     self.trainer.dones[-1] = 1.0
                     self.trainer.ep += 1
@@ -114,17 +116,18 @@ class Session:
             return [0, 0]
 
         if self.runtime.training_mode == "ppo":
-            reward = (state_d[0] - self.prev_size) * 10 if self.prev_size is not None else 0.0
+            growth = (state_d[0] - self.prev_size) * 10 if self.prev_size is not None else 0.0
+            reward = growth + 0.5  # survival reward: longer episodes score higher regardless of growth
             self.prev_size = state_d[0]
             x = get_flat(state_d)
             _, _, is_avoiding = bot_script(state_d)
             x_aug = np.append(x, float(is_avoiding)).astype(np.float32)
             x_t = torch.from_numpy(x_aug).unsqueeze(0).to(self.runtime.device)
             with torch.no_grad():
-                direction, boost, log_prob, value = self.runtime.model.act(x_t)
-            self.runtime.trainer.push(x_aug, direction, boost, log_prob, value, reward, False)
+                game_dir, boost, log_prob, value, raw_dir = self.runtime.model.act(x_t)
+            self.runtime.trainer.push(x_aug, raw_dir, boost, log_prob, value, reward, False)
             self.episode_steps += 1
-            return [direction, boost]
+            return [game_dir, boost]
 
         x = get_flat(state_d)
         target_dir, target_boost, is_avoiding = bot_script(state_d)

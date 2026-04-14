@@ -6,10 +6,35 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-K_FOOD = 10    # nearest food items to use
-K_SNAKE = 3    # nearest snakes to use
-K_SEGMENTS = 1 # examine K_SEGMENTS * 2 around nearest
-K_OWN_SEGS = 7 # examine K_OWN_SEGS segments of self
+K_FOOD = 10     # nearest food items to use
+K_SNAKE = 3     # nearest snakes to use
+K_SEGMENTS = 1  # examine K_SEGMENTS * 2 around nearest
+K_OWN_SEGS = 7  # examine K_OWN_SEGS segments of self
+
+IN_DIM = 1 + K_FOOD * 3 + K_SNAKE * (2 * K_SEGMENTS + 1) * 2 + K_SNAKE * 4 + K_OWN_SEGS * 2
+
+GAMMA = 0.99
+LAM = 0.95
+LR = 1e-3
+CLIP = 0.2
+PPO_EPOCHS = 4
+SL_EPOCHS = 4
+BATCH_SIZE = 64       # supervised replay batch
+PPO_BATCH  = 256      # PPO rollout buffer — larger = more GAE context for credit assignment
+MINI_BATCH = 16
+REPLAY_SIZE = 2000
+
+SAVE_PATH = "model.pt"
+AVOID_DIST = 250
+HEADING_INDEX = 0
+FOOD_START_INDEX = 1
+FOOD_END_INDEX = FOOD_START_INDEX + K_FOOD * 3
+AVOID_ANGLE_INDEX = FOOD_END_INDEX + (K_SEGMENTS + 1) * 2  # nearest segment angle of nearest snake
+AVOID_DIST_INDEX  = AVOID_ANGLE_INDEX + 1
+IS_AVOIDING_INDEX = IN_DIM
+
+AVOID_FOCUS_IN = 3               # heading + avoid_angle + avoid_dist
+FOOD_FOCUS_IN  = 1 + K_FOOD * 3  # heading + K_FOOD food triplets
 
 
 def parse_record(d):
@@ -42,7 +67,7 @@ def make_flat_input(food, own_meta, own_body, snakes_meta, snakes_body):
     nearest_snakes = [snakes_body[i] for i in nearest_ixs]
     nearest_segments = [s[:, 1].argmin() for s in nearest_snakes]
     segments = [i + np.arange(-K_SEGMENTS, K_SEGMENTS + 1) for i in nearest_segments]
-    snake_parts = [np.pad(sb, ((1, 1), (0, 0)))[segs] for sb, segs in zip(nearest_snakes, segments)]
+    snake_parts = [np.pad(sb, ((1, 1), (0, 0)))[np.clip(segs, 0, len(sb) + 1)] for sb, segs in zip(nearest_snakes, segments)]
     _snake_flat = np.concat(snake_parts).flatten() if snake_parts else np.array([], dtype=np.float32)
     snake_flat = np.zeros(K_SNAKE * (2 * K_SEGMENTS + 1) * 2, dtype=np.float32)
     snake_flat[:len(_snake_flat)] = _snake_flat
@@ -58,33 +83,12 @@ def make_flat_input(food, own_meta, own_body, snakes_meta, snakes_body):
     return np.concatenate([[own_meta[1]], food_flat, snake_flat, nearest_metas, own_segs]).astype(np.float32)
 
 
-IN_DIM = 1 + K_FOOD * 3 + K_SNAKE * (2 * K_SEGMENTS + 1) * 2 + K_SNAKE * 4 + K_OWN_SEGS * 2
-
-GAMMA = 0.99
-LAM = 0.95
-LR = 1e-3
-CLIP = 0.2
-PPO_EPOCHS = 4
-SL_EPOCHS = 4
-BATCH_SIZE = 64
-MINI_BATCH = 16
-REPLAY_SIZE = 2000
-
-SAVE_PATH = "model.pt"
-AVOID_DIST = 250
-HEADING_INDEX = 0
-FOOD_START_INDEX = 1
-FOOD_END_INDEX = FOOD_START_INDEX + K_FOOD * 3
-AVOID_ANGLE_INDEX = 35
-AVOID_DIST_INDEX = 36
-IS_AVOIDING_INDEX = IN_DIM
-
-AVOID_FOCUS_IN = 3               # heading + avoid_angle + avoid_dist
-FOOD_FOCUS_IN  = 1 + K_FOOD * 3  # heading + K_FOOD food triplets
-
-
 def avoid_focus_features(x):
-    return x[..., [HEADING_INDEX, AVOID_ANGLE_INDEX, AVOID_DIST_INDEX]]
+    return torch.stack([
+        x[..., HEADING_INDEX],
+        x[..., AVOID_ANGLE_INDEX],
+        x[..., AVOID_DIST_INDEX] / AVOID_DIST,  # normalize to [0, 1] so dist doesn't dwarf angle inputs
+    ], dim=-1)
 
 
 def food_focus_features(x):
@@ -167,18 +171,23 @@ class ActorCritic(nn.Module):
         dir_std = self.dir_log_std.clamp(-4, 2).exp()
         dir_dist = torch.distributions.Normal(dir_mean, dir_std)
         boost_dist = torch.distributions.Categorical(logits=boost_logits)
-        dir_action = dir_dist.sample().clamp(-1, 1)
+        raw_dir = dir_dist.sample()
         boost_idx = boost_dist.sample()
-        log_prob = dir_dist.log_prob(dir_action).sum() + boost_dist.log_prob(boost_idx)
-        return dir_action.item(), boost_idx.item(), log_prob.item(), value.item()
+        # log_prob on raw (pre-clamp) sample — computing it on the clamped value creates
+        # a degenerate gradient that collapses std and pushes dir_mean to ±1.
+        log_prob = dir_dist.log_prob(raw_dir).sum() + boost_dist.log_prob(boost_idx)
+        game_dir = raw_dir.clamp(-1, 1)
+        return game_dir.item(), boost_idx.item(), log_prob.item(), value.item(), raw_dir.item()
 
     def evaluate(self, x, dir_actions, boost_idx):
         dir_mean, boost_logits, value = self(x)
         dir_std = self.dir_log_std.clamp(-4, 2).exp()
         dir_dist = torch.distributions.Normal(dir_mean, dir_std)
         boost_dist = torch.distributions.Categorical(logits=boost_logits)
-        log_prob = dir_dist.log_prob(dir_actions).sum(-1) + boost_dist.log_prob(boost_idx)
-        entropy = dir_dist.entropy().sum(-1) + boost_dist.entropy()
+        # Boost excluded from PPO policy loss — growth reward doesn't capture correct
+        # boost timing (boosting shrinks the snake), so including it causes wrong behavior.
+        log_prob = dir_dist.log_prob(dir_actions).sum(-1)
+        entropy = dir_dist.entropy().sum(-1)
         return log_prob, entropy, value
 
 
@@ -186,7 +195,17 @@ class PPOTrainer:
     def __init__(self, model: ActorCritic, device):
         self.model = model
         self.device = device
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+        # Only update RL-specific parameters — supervised focus heads are excluded
+        # so PPO's sparse reward signal doesn't corrupt the imitation-learned behavior.
+        # dir_residual and boost_head use a lower LR so the focus signal isn't overridden
+        # before the shared network has learned anything useful.
+        self.optimizer = torch.optim.Adam([
+            {'params': list(model.shared.parameters()) +
+                       list(model.value_head.parameters()) +
+                       [model.dir_log_std],                'lr': LR},
+            {'params': list(model.dir_residual.parameters()) +
+                       list(model.boost_head.parameters()), 'lr': LR * 0.1},
+        ])
         self.lock = threading.Lock()
 
         self.states = []
@@ -213,7 +232,7 @@ class PPOTrainer:
             if done:
                 self.ep += 1
 
-            if len(self.states) >= BATCH_SIZE:
+            if len(self.states) >= PPO_BATCH:
                 self._update()
 
     def _gae(self, rewards, values, dones, last_value):
@@ -261,7 +280,8 @@ class PPOTrainer:
                 loss = policy_loss + 0.5 * value_loss - 0.01 * ent.mean()
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), 0.5)
+                all_ppo_params = [p for g in self.optimizer.param_groups for p in g['params']]
+                nn.utils.clip_grad_norm_(all_ppo_params, 0.5)
                 self.optimizer.step()
 
         ep_reward = sum(rewards)
@@ -309,8 +329,6 @@ class SupervisedTrainer:
         states = torch.from_numpy(np.array([self._replay_states[i] for i in idxs], dtype=np.float32)).to(self.device)
         tds = torch.tensor([self._replay_dirs[i] for i in idxs], dtype=torch.float32).to(self.device)
         tbs = torch.tensor([self._replay_boosts[i] for i in idxs], dtype=torch.long).to(self.device)
-        n_avoid = int((states[:, IS_AVOIDING_INDEX] > 0.5).sum().item())
-        n_food = BATCH_SIZE - n_avoid
         total_loss = 0.0
         num_batches = 0
         for _ in range(SL_EPOCHS):
@@ -318,11 +336,8 @@ class SupervisedTrainer:
                 dir_mean = self.model.supervised_dir(states[mb])
                 angle_err = (dir_mean - tds[mb]) % 2
                 angle_err = torch.where(angle_err > 1, angle_err - 2, angle_err)
-                loss = (angle_err ** 2).mean()
-                avoid_mb = states[mb, IS_AVOIDING_INDEX] > 0.5
-                if avoid_mb.any():
-                    boost_logits = self.model.boost_focus_logits(states[mb][avoid_mb])
-                    loss = loss + F.cross_entropy(boost_logits, tbs[mb][avoid_mb])
+                boost_logits = self.model.boost_focus_logits(states[mb])
+                loss = (angle_err ** 2).mean() + F.cross_entropy(boost_logits, tbs[mb])
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.model.focus_parameters(), 2.0)
@@ -330,7 +345,7 @@ class SupervisedTrainer:
                 total_loss += loss.item()
                 num_batches += 1
         avg = total_loss / num_batches
-        print(f"[SL] steps={self.total_steps} buf={buf_size} avg_loss={avg:.4f} avoid={n_avoid} food={n_food}")
+        print(f"[SL] steps={self.total_steps} buf={buf_size} avg_loss={avg:.4f}")
         torch.save({"model": self.model.state_dict(), "ep": self.ep, "total_steps": self.total_steps}, SAVE_PATH)
 
     def reset_optimizer(self):
@@ -374,9 +389,6 @@ def bot_script(state_d):
         target_angle = angle_sub(avoid_angle, 1)
         if abs(angle_sub(heading, target_angle)) < .3:
             boost = 1
-            #print('BOOST', min_dist, target_angle, heading, avoid_angle)
-        #else:
-        #    print('AVOID', min_dist, target_angle, heading, avoid_angle)
 
     else:
         # Seek food with best size-per-distance value, restricted to the same
@@ -390,7 +402,6 @@ def bot_script(state_d):
             if val < best_val and dist > 50 * snake_scale:
                 best_val = val
                 target_angle = angle
-        #print('FOOD', best_val, angle, heading)
 
     is_avoiding = min_dist < AVOID_DIST and avoid_angle is not None
     return [target_angle, boost, is_avoiding]

@@ -59,7 +59,7 @@ bot.connect = ()=>{
         window.xm = Math.cos(angle) * 100
         window.ym = Math.sin(angle) * 100
         setAcceleration(boost)
-        //console.log(angle, boost, slither.ang, slither.wang)
+        if(!(bot.counter % 10)) console.log(angle, boost, slither.ang, slither.wang)
         bot.counter += 1
         //const now = new Date().getTime()
         //console.log(now - bot.t0, now - time)
