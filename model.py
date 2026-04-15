@@ -7,8 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 K_FOOD = 10     # nearest food items to use
-K_SNAKE = 3     # nearest snakes to use
-K_SEGMENTS = 1  # examine K_SEGMENTS * 2 around nearest
+K_SNAKE = 4     # nearest snakes to use
+K_SEGMENTS = 10 # examine K_SEGMENTS * 2 around nearest
 K_OWN_SEGS = 7  # examine K_OWN_SEGS segments of self
 
 IN_DIM = 1 + K_FOOD * 3 + K_SNAKE * (2 * K_SEGMENTS + 1) * 2 + K_SNAKE * 4 + K_OWN_SEGS * 2
@@ -156,7 +156,11 @@ class ActorCritic(nn.Module):
     def dir_logits(self, x, h=None):
         if h is None:
             h = self.shared(x)
-        return self.dir_focus_logits(x) + self.dir_residual(h)
+        # Detach h so policy gradient only flows through dir_residual's own weights,
+        # not back into the shared network. Value gradient still flows through h normally.
+        # Without detach, h drifts under value training and dir_residual(h) accumulates
+        # a growing bias that saturates tanh and collapses dir_mean to ±1.
+        return self.dir_focus_logits(x) + self.dir_residual(h.detach())
 
     def supervised_dir(self, x):
         return torch.tanh(self.dir_focus_logits(x)).squeeze(-1)
@@ -277,7 +281,7 @@ class PPOTrainer:
                 a = adv[mb]
                 policy_loss = -torch.min(ratio * a, ratio.clamp(1 - CLIP, 1 + CLIP) * a).mean()
                 value_loss = F.mse_loss(val, ret[mb])
-                loss = policy_loss + 0.5 * value_loss - 0.01 * ent.mean()
+                loss = policy_loss + 0.5 * value_loss - 0.05 * ent.mean()
                 self.optimizer.zero_grad()
                 loss.backward()
                 all_ppo_params = [p for g in self.optimizer.param_groups for p in g['params']]
