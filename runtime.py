@@ -5,15 +5,8 @@ import torch
 import torch.nn as nn
 
 from model import (
-    AVOID_DIST,
-    BATCH_SIZE,
-    PPO_BATCH,
-    LR,
-    MINI_BATCH,
     SAVE_PATH,
     ActorCritic,
-    PPOTrainer,
-    SupervisedTrainer,
     bot_script,
     get_flat,
 )
@@ -39,30 +32,21 @@ def load_compatible_state_dict(model, state_dict):
 
 class Runtime:
     def __init__(self):
-        self.training_mode = "ppo"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model = ActorCritic().to(self.device)
-        self.resume_ep = 0
-        self.resume_steps = 0
         try:
             ckpt = torch.load(SAVE_PATH, map_location=self.device)
-            if isinstance(ckpt, dict) and "model" in ckpt:
-                missing, unexpected, skipped = load_compatible_state_dict(self.model, ckpt["model"])
-                self.resume_ep = ckpt.get("ep", 0)
-                self.resume_steps = ckpt.get("total_steps", 0)
-            else:
-                missing, unexpected, skipped = load_compatible_state_dict(self.model, ckpt)
-            print(f"Resumed from {SAVE_PATH} (ep={self.resume_ep} steps={self.resume_steps})")
+            state = ckpt["model"] if isinstance(ckpt, dict) and "model" in ckpt else ckpt
+            missing, unexpected, skipped = load_compatible_state_dict(self.model, state)
+            ep = ckpt.get("ep", 0) if isinstance(ckpt, dict) else 0
+            steps = ckpt.get("total_steps", 0) if isinstance(ckpt, dict) else 0
+            print(f"Resumed from {SAVE_PATH} (ep={ep} steps={steps})")
             if missing:
                 print(f"Missing checkpoint keys: {missing}")
             if unexpected:
                 print(f"Unexpected checkpoint keys: {unexpected}")
             if skipped:
                 print(f"Skipped incompatible checkpoint keys: {skipped}")
-            # If the shared network's first layer was skipped, its weights are randomly
-            # initialized. dir_residual and boost_head are shape-compatible so they loaded
-            # from the old checkpoint, but they produce garbage with a random h.
-            # Re-zero them so PPO mode starts from the same clean slate as supervised mode.
             if any("shared.0" in k for k in skipped):
                 nn.init.zeros_(self.model.dir_residual.weight)
                 nn.init.zeros_(self.model.dir_residual.bias)
@@ -72,88 +56,25 @@ class Runtime:
         except FileNotFoundError:
             print("Starting fresh")
 
-        self.model.train()
-        self.trainer = PPOTrainer(self.model, self.device)
-        self.trainer.ep = self.resume_ep
-        self.trainer.total_steps = self.resume_steps
-        self.sl_trainer = SupervisedTrainer(self.model, self.device)
-        self.sl_trainer.ep = self.resume_ep
-        self.sl_trainer.total_steps = self.resume_steps
-
-    def set_training_mode(self, mode):
-        if mode not in ("ppo", "supervised"):
-            raise ValueError(f"mode: {mode} must be 'ppo' or 'supervised'")
-        self.training_mode = mode
-        print(f"[config] TRAINING_MODE -> {mode}")
-
-    def reset_optimizer(self):
-        self.sl_trainer.reset_optimizer()
-
-    def get_config(self):
-        return {
-            "AVOID_DIST": AVOID_DIST,
-            "TRAINING_MODE": self.training_mode,
-            "LR": LR,
-            "BATCH_SIZE": BATCH_SIZE,
-            "PPO_BATCH": PPO_BATCH,
-            "MINI_BATCH": MINI_BATCH,
-        }
-
-    def finish_episode(self, episode_steps):
-        if self.training_mode == "ppo":
-            with self.trainer.lock:
-                n = min(10, episode_steps, len(self.trainer.rewards))
-                for i in range(-n, 0):
-                    self.trainer.rewards[i] = -20
-                if n > 0:
-                    self.trainer.dones[-1] = 1.0
-                    self.trainer.ep += 1
-        else:
-            self.sl_trainer.finish_episode()
+        self.model.eval()
 
 
 class Session:
     def __init__(self, runtime: Runtime):
         self.runtime = runtime
-        self.prev_size = None
-        self.episode_steps = 0
 
     def handle_message(self, state_d):
         if not state_d:
             print("DEAD\n")
-            self.runtime.finish_episode(self.episode_steps)
-            self.prev_size = None
-            self.episode_steps = 0
             return [0, 0]
 
-        if self.runtime.training_mode == "ppo":
-            growth = (state_d[0] - self.prev_size) * 10 if self.prev_size is not None else 0.0
-            _, _, is_avoiding = bot_script(state_d)
-            if is_avoiding:
-                min_dist = min(
-                    (dist for snake in state_d[3] for dist in snake[5::2]),
-                    default=float('inf')
-                )
-                danger = -3.0 * max(0.0, 1.0 - min_dist / AVOID_DIST)
-            else:
-                danger = 0.0
-            reward = growth + 0.5 + danger
-            self.prev_size = state_d[0]
-            x = get_flat(state_d)
-            x_aug = np.append(x, float(is_avoiding)).astype(np.float32)
-            x_t = torch.from_numpy(x_aug).unsqueeze(0).to(self.runtime.device)
-            with torch.no_grad():
-                game_dir, boost, log_prob, value, raw_dir = self.runtime.model.act(x_t)
-            self.runtime.trainer.push(x_aug, raw_dir, boost, log_prob, value, reward, False)
-            self.episode_steps += 1
-            return [game_dir, boost, time() * 1000]
-
         x = get_flat(state_d)
-        target_dir, target_boost, is_avoiding = bot_script(state_d)
+        _, _, is_avoiding = bot_script(state_d)
         x_aug = np.append(x, float(is_avoiding)).astype(np.float32)
-        self.runtime.sl_trainer.step(x_aug, target_dir, target_boost)
-        self.episode_steps += 1
-        return [target_dir, target_boost, time() * 1000]
+        x_t = torch.from_numpy(x_aug).unsqueeze(0).to(self.runtime.device)
+        with torch.no_grad():
+            game_dir, boost, _, _, _ = self.runtime.model.act(x_t)
+        return [game_dir, boost, time() * 1000]
 
 
 _runtime = None
