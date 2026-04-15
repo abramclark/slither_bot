@@ -61,9 +61,7 @@ def run(args):
             xt = torch.from_numpy(x_aug).unsqueeze(0)
 
             with torch.no_grad():
-                pred_dir = model.supervised_dir(xt).item()
-                boost_logits = model.boost_focus_logits(xt)
-                pred_boost = int(boost_logits.argmax(dim=-1).item())
+                pred_dir, pred_boost, _, _, _ = model.act(xt)
 
             err = angle_err(pred_dir, target_dir)
             if is_avoiding:

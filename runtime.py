@@ -2,6 +2,7 @@ from time import time
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 from model import (
     AVOID_DIST,
@@ -58,6 +59,16 @@ class Runtime:
                 print(f"Unexpected checkpoint keys: {unexpected}")
             if skipped:
                 print(f"Skipped incompatible checkpoint keys: {skipped}")
+            # If the shared network's first layer was skipped, its weights are randomly
+            # initialized. dir_residual and boost_head are shape-compatible so they loaded
+            # from the old checkpoint, but they produce garbage with a random h.
+            # Re-zero them so PPO mode starts from the same clean slate as supervised mode.
+            if any("shared.0" in k for k in skipped):
+                nn.init.zeros_(self.model.dir_residual.weight)
+                nn.init.zeros_(self.model.dir_residual.bias)
+                nn.init.zeros_(self.model.boost_head.weight)
+                nn.init.zeros_(self.model.boost_head.bias)
+                print("Architecture changed: zeroed dir_residual and boost_head")
         except FileNotFoundError:
             print("Starting fresh")
 
@@ -135,7 +146,7 @@ class Session:
                 game_dir, boost, log_prob, value, raw_dir = self.runtime.model.act(x_t)
             self.runtime.trainer.push(x_aug, raw_dir, boost, log_prob, value, reward, False)
             self.episode_steps += 1
-            return [game_dir, boost]
+            return [game_dir, boost, time() * 1000]
 
         x = get_flat(state_d)
         target_dir, target_boost, is_avoiding = bot_script(state_d)
