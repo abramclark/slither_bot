@@ -117,10 +117,18 @@ class Session:
 
         if self.runtime.training_mode == "ppo":
             growth = (state_d[0] - self.prev_size) * 10 if self.prev_size is not None else 0.0
-            reward = growth + 0.5  # survival reward: longer episodes score higher regardless of growth
+            _, _, is_avoiding = bot_script(state_d)
+            if is_avoiding:
+                min_dist = min(
+                    (dist for snake in state_d[3] for dist in snake[5::2]),
+                    default=float('inf')
+                )
+                danger = -3.0 * max(0.0, 1.0 - min_dist / AVOID_DIST)
+            else:
+                danger = 0.0
+            reward = growth + 0.5 + danger
             self.prev_size = state_d[0]
             x = get_flat(state_d)
-            _, _, is_avoiding = bot_script(state_d)
             x_aug = np.append(x, float(is_avoiding)).astype(np.float32)
             x_t = torch.from_numpy(x_aug).unsqueeze(0).to(self.runtime.device)
             with torch.no_grad():
