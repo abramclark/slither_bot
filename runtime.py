@@ -10,6 +10,10 @@ from model import (
     bot_script,
     get_flat,
 )
+from survival_model import SURVIVAL_SAVE_PATH, SurvivalNet
+from value_model import VALUE_SAVE_PATH, ValueNet
+
+SURVIVAL_FOOD_THRESHOLD = 2.0  # log(frames+1); expm1(2.0) ≈ 6.4 frames
 
 
 def load_compatible_state_dict(model, state_dict):
@@ -77,7 +81,73 @@ class Session:
         return [game_dir, boost, time() * 1000]
 
 
+class SurvivalRuntime:
+    def __init__(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = SurvivalNet().to(self.device)
+        try:
+            ckpt = torch.load(SURVIVAL_SAVE_PATH, map_location=self.device)
+            self.model.load_state_dict(ckpt["model"])
+            ep = ckpt.get("ep", 0)
+            print(f"Survival: resumed from {SURVIVAL_SAVE_PATH} (ep={ep})")
+        except FileNotFoundError:
+            print(f"Survival: no checkpoint at {SURVIVAL_SAVE_PATH}, starting fresh")
+        self.model.eval()
+
+
+class SurvivalSession:
+    def __init__(self, runtime: SurvivalRuntime):
+        self.runtime = runtime
+
+    def handle_message(self, state_d):
+        if not state_d:
+            print("DEAD (survival)\n")
+            return [0, 0]
+
+        x = get_flat(state_d).astype(np.float32)
+        game_dir, boost, val = self.runtime.model.act(x)
+
+        if val > SURVIVAL_FOOD_THRESHOLD:
+            food_dir, food_boost, _ = bot_script(state_d)
+            print(f"[survival] FOOD  dir={food_dir:.3f}  boost={food_boost}  val={val:.3f}")
+            return [food_dir, food_boost, time() * 1000]
+
+        print(f"[survival] EVADE dir={game_dir:.3f}  boost={boost}  val={val:.3f}")
+        return [game_dir, boost, time() * 1000]
+
+
+class ValueRuntime:
+    def __init__(self):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = ValueNet().to(self.device)
+        try:
+            ckpt = torch.load(VALUE_SAVE_PATH, map_location=self.device, weights_only=True)
+            self.model.load_state_dict(ckpt["model"])
+            ep = ckpt.get("ep", 0)
+            print(f"Value: resumed from {VALUE_SAVE_PATH} (ep={ep})")
+        except FileNotFoundError:
+            print(f"Value: no checkpoint at {VALUE_SAVE_PATH}, starting fresh")
+        self.model.eval()
+
+
+class ValueSession:
+    def __init__(self, runtime: ValueRuntime):
+        self.runtime = runtime
+
+    def handle_message(self, state_d):
+        if not state_d:
+            print("DEAD (value)\n")
+            return [0, 0]
+
+        x = get_flat(state_d).astype(np.float32)
+        game_dir, boost, val = self.runtime.model.act(x)
+        print(f"[value] dir={game_dir:.3f}  boost={boost}  val={val:.3f}")
+        return [game_dir, boost, time() * 1000]
+
+
 _runtime = None
+_survival_runtime = None
+_value_runtime = None
 
 
 def get_runtime():
@@ -85,3 +155,17 @@ def get_runtime():
     if _runtime is None:
         _runtime = Runtime()
     return _runtime
+
+
+def get_survival_runtime():
+    global _survival_runtime
+    if _survival_runtime is None:
+        _survival_runtime = SurvivalRuntime()
+    return _survival_runtime
+
+
+def get_value_runtime():
+    global _value_runtime
+    if _value_runtime is None:
+        _value_runtime = ValueRuntime()
+    return _value_runtime

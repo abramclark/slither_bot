@@ -8,10 +8,9 @@ import torch.nn.functional as F
 
 K_FOOD = 10     # nearest food items to use
 K_SNAKE = 4     # nearest snakes to use
-K_SEGMENTS = 10 # examine K_SEGMENTS * 2 around nearest
-K_OWN_SEGS = 7  # examine K_OWN_SEGS segments of self
+K_SEGMENTS = 15 # examine K_SEGMENTS of snakes
 
-IN_DIM = 1 + K_FOOD * 3 + K_SNAKE * (2 * K_SEGMENTS + 1) * 2 + K_SNAKE * 4 + K_OWN_SEGS * 2
+IN_DIM = 4 + K_FOOD * 3 + K_SNAKE * (K_SEGMENTS + 1) * 2 + K_SNAKE * 4 + K_SEGMENTS * 2
 
 GAMMA = 0.99
 LAM = 0.95
@@ -26,10 +25,12 @@ REPLAY_SIZE = 2000
 
 SAVE_PATH = "model.pt"
 AVOID_DIST = 250
-HEADING_INDEX = 0
-FOOD_START_INDEX = 1
+DIR_INDEX     = 0       # own_meta[0] = turning direction
+HEADING_INDEX = 1       # own_meta[1] = heading angle
+BOOST_INDEX   = 2       # own_meta[2] = is boosting
+FOOD_START_INDEX = 4   # own_meta occupies indices 0-3
 FOOD_END_INDEX = FOOD_START_INDEX + K_FOOD * 3
-AVOID_ANGLE_INDEX = FOOD_END_INDEX + (K_SEGMENTS + 1) * 2  # nearest segment angle of nearest snake
+AVOID_ANGLE_INDEX = FOOD_END_INDEX # nearest segment angle of nearest snake
 AVOID_DIST_INDEX  = AVOID_ANGLE_INDEX + 1
 IS_AVOIDING_INDEX = IN_DIM
 
@@ -43,7 +44,7 @@ def parse_record(d):
     self_data = d[2]
     target_dir = float(self_data[0])
     target_boost = float(self_data[2])
-    own_meta = np.array(self_data[0:4], dtype=np.float32)   # [speed, ?, ?]
+    own_meta = np.array(self_data[0:4], dtype=np.float32)   # [dir, heading, boost, snake_scale]
     own_body = np.array(self_data[6:], dtype=np.float32).reshape(-1, 2)
     snakes_meta = [np.array(s[:4], dtype=np.float32) for s in d[3]]
     snakes_body = [np.array(s[4:], dtype=np.float32).reshape(-1, 2) for s in d[3]]
@@ -62,32 +63,35 @@ def make_flat_input(food, own_meta, own_body, snakes_meta, snakes_body):
             valid = valid[(valid[:, 2] / valid[:, 0]).argsort()]
             food_flat[:len(valid) * 3] = valid.flatten()
 
-    smallest_dists = np.array([s[:, 1].min() for s in snakes_body])
+    nearest_seg_ixs = [s[:, 1].argmin() for s in snakes_body]
+    smallest_dists = np.array([snakes_body[i][nearest_seg_ixs[i], 1] for i in range(len(snakes_body))])
     nearest_ixs = smallest_dists.argsort()[:K_SNAKE]
-    nearest_snakes = [snakes_body[i] for i in nearest_ixs]
-    nearest_segments = [s[:, 1].argmin() for s in nearest_snakes]
-    segments = [i + np.arange(-K_SEGMENTS, K_SEGMENTS + 1) for i in nearest_segments]
-    snake_parts = [np.pad(sb, ((1, 1), (0, 0)))[np.clip(segs, 0, len(sb) + 1)] for sb, segs in zip(nearest_snakes, segments)]
-    _snake_flat = np.concat(snake_parts).flatten() if snake_parts else np.array([], dtype=np.float32)
-    snake_flat = np.zeros(K_SNAKE * (2 * K_SEGMENTS + 1) * 2, dtype=np.float32)
+    nearest_snakes = [np.concatenate([snakes_body[i][[nearest_seg_ixs[i]]],
+                                      select_evenly_spaced(snakes_body[i], K_SEGMENTS)])
+                      for i in nearest_ixs]
+    _snake_flat = np.concat(nearest_snakes).flatten() if nearest_snakes else np.array([], dtype=np.float32)
+    snake_flat = np.zeros(K_SNAKE * (K_SEGMENTS + 1) * 2, dtype=np.float32)
     snake_flat[:len(_snake_flat)] = _snake_flat
     _metas = np.concatenate([snakes_meta[i] for i in nearest_ixs]) if len(nearest_ixs) else np.array([], dtype=np.float32)
     nearest_metas = np.zeros(K_SNAKE * 4, dtype=np.float32)
     nearest_metas[:len(_metas)] = _metas
 
-    own_skip = max(1, len(own_body) // K_OWN_SEGS)
-    _segs = own_body[own_skip::own_skip][:K_OWN_SEGS].flatten()
-    own_segs = np.zeros(K_OWN_SEGS * 2, dtype=np.float32)
-    own_segs[:len(_segs)] = _segs
+    _own_segs = select_evenly_spaced(own_body, K_SEGMENTS).flatten()
+    own_segs = np.zeros(K_SEGMENTS * 2, dtype=np.float32)
+    own_segs[:len(_own_segs)] = _own_segs
 
-    return np.concatenate([[own_meta[1]], food_flat, snake_flat, nearest_metas, own_segs]).astype(np.float32)
+    food_flat[2::3] /= AVOID_DIST
+    snake_flat[1::2] /= AVOID_DIST
+    own_segs[1::2]   /= AVOID_DIST
+
+    return np.concatenate([own_meta, food_flat, snake_flat, nearest_metas, own_segs]).astype(np.float32)
 
 
 def avoid_focus_features(x):
     return torch.stack([
         x[..., HEADING_INDEX],
         x[..., AVOID_ANGLE_INDEX],
-        x[..., AVOID_DIST_INDEX] / AVOID_DIST,  # normalize to [0, 1] so dist doesn't dwarf angle inputs
+        x[..., AVOID_DIST_INDEX],
     ], dim=-1)
 
 
@@ -365,13 +369,6 @@ class SupervisedTrainer:
             self._ep_steps = 0
 
 
-def angle_sub(from_ang, to):
-    d = (from_ang - to) % 2
-    if d > 1:
-        d -= 2
-    return d
-
-
 def bot_script(state_d):
     food_dat = state_d[1]   # [[sz, angle_pi, dist], ...]
     own_props = state_d[2]
@@ -414,3 +411,22 @@ def bot_script(state_d):
 def get_flat(d):
     own_size, food, own_meta, own_body, snakes_meta, snakes_body, _, _ = parse_record(d)
     return make_flat_input(food, own_meta, own_body, snakes_meta, snakes_body)
+
+
+def angle_sub(from_ang, to):
+    d = (from_ang - to) % 2
+    if d > 1:
+        d -= 2
+    return d
+
+
+def select_evenly_spaced(arr, k):
+    if k <= 0:
+        return np.array([])
+    if k == 1:
+        return arr[:1]
+    if k >= len(arr):
+        return arr.copy()
+
+    indices = np.round(np.linspace(0, len(arr) - 1, k)).astype(int)
+    return arr[indices]
