@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 """
-Compute value function labels for each frame in experience.jsonl.
+Compute return labels for each frame in experience.jsonl.
 
-  No death in N frames:  V = size(t+N) - size(t) - 0.053 * N
-  Death at frame k <= N: V = -size(t) - 0.053 * k - 1
-                             (size drops to 0; -1 is the death penalty)
-
-The death case is always negative: -size(t) < 0, -0.053*k < 0, -1 < 0.
-The survival case is positive when the snake grows faster than average.
-
-Invalid/death-marker/trailing frames get label NaN.
+Labels are the sum of two independent components:
+  alive_norm: discounted alive returns (r=0 at terminal), normalized to mean=1 std=1
+  death_disc: death_value * gamma^(T-1-t), so terminal frame gets ~death_value
 
 Usage:
     python label_value.py < experience-t0.jsonl > value_labels.npy
-    python label_value.py --horizon 30 < experience-t0.jsonl > value_labels.npy
+    python label_value.py --gamma 0.95 --death-value -20 < experience.jsonl > labels.npy
 """
 import argparse
 import json
@@ -22,7 +17,7 @@ import sys
 import numpy as np
 
 
-def label(horizon):
+def label(gamma, death_value):
     lines = []
     for raw in sys.stdin:
         raw = raw.strip()
@@ -31,9 +26,9 @@ def label(horizon):
 
     labels = np.full(len(lines), np.nan, dtype=np.float32)
 
-    episode: list[tuple[int, float]] = []  # (line_idx, size)
-    n_episodes = 0
-    n_skipped  = 0
+    episodes: list[list[tuple[int, float]]] = []
+    episode:  list[tuple[int, float]]       = []
+    n_skipped = 0
 
     for i, raw in enumerate(lines):
         try:
@@ -41,18 +36,10 @@ def label(horizon):
         except json.JSONDecodeError:
             n_skipped += 1
             continue
-
         if isinstance(d, list) and len(d) == 0:
-            T = len(episode)
-            for t, (li, size_t) in enumerate(episode):
-                k = T - t  # frames until death (1 for the last frame)
-                if k <= horizon:
-                    labels[li] = -size_t - 0.053 * k - 1.0
-                else:
-                    _, size_end = episode[t + horizon]
-                    labels[li] = size_end - size_t - 0.053 * horizon
-            episode.clear()
-            n_episodes += 1
+            if episode:
+                episodes.append(episode)
+                episode = []
         elif isinstance(d, list) and len(d) == 4:
             episode.append((i, float(d[0])))
         else:
@@ -60,27 +47,57 @@ def label(horizon):
 
     trailing = len(episode)
 
+    deltas = [episode[t + 1][1] - episode[t][1]
+              for episode in episodes
+              for t in range(len(episode) - 1)]
+    avg_value = float(np.mean(deltas)) if deltas else 0.0
+
+    # Pass 1: alive-only returns (r=0 at terminal) for normalization stats
+    labels_alive = np.full(len(lines), np.nan, dtype=np.float32)
+    for episode in episodes:
+        T = len(episode)
+        G = 0.0
+        for t in reversed(range(T)):
+            li, size_t = episode[t]
+            r = 0.0 if t == T - 1 else episode[t + 1][1] - size_t - avg_value
+            G = r + gamma * G
+            labels_alive[li] = G
+
+    alive_vals = labels_alive[~np.isnan(labels_alive)]
+    mean, std = float(alive_vals.mean()), float(alive_vals.std())
+
+    # Pass 2: alive_norm (mean=1) + discounted death signal
+    for episode in episodes:
+        T = len(episode)
+        for t in range(T):
+            li, _ = episode[t]
+            alive_norm = (labels_alive[li] - mean) / (std + 1e-8) + 1.0
+            death_disc = death_value * (gamma ** (T - 1 - t))
+            labels[li] = alive_norm + death_disc
+
+    valid_mask = ~np.isnan(labels)
+    n_labeled = int(valid_mask.sum())
+
     np.save(sys.stdout.buffer, labels)
 
-    valid = labels[~np.isnan(labels)]
-    print(f"Horizon:        {horizon}",                  file=sys.stderr)
-    print(f"Episodes:       {n_episodes}",               file=sys.stderr)
-    print(f"Labeled frames: {len(valid)}",               file=sys.stderr)
-    print(f"Trailing:       {trailing}",                 file=sys.stderr)
-    print(f"Skipped:        {n_skipped}",                file=sys.stderr)
-    if len(valid):
-        n_death = int((valid < -1.0).sum())
-        print(f"Death cases:    {n_death} / {len(valid)} "
-              f"({100 * n_death / len(valid):.1f}%)", file=sys.stderr)
-        print(f"Value stats:    mean={valid.mean():.3f}  std={valid.std():.3f}  "
-              f"min={valid.min():.3f}  max={valid.max():.3f}", file=sys.stderr)
+    normed = labels[valid_mask]
+    print(f"Gamma:          {gamma}",              file=sys.stderr)
+    print(f"Avg value/frame:{avg_value:.5f}",      file=sys.stderr)
+    print(f"Episodes:       {len(episodes)}",      file=sys.stderr)
+    print(f"Labeled frames: {n_labeled}",          file=sys.stderr)
+    print(f"Trailing:       {trailing}",           file=sys.stderr)
+    print(f"Skipped:        {n_skipped}",          file=sys.stderr)
+    print(f"Alive-only: mean={mean:.3f}  std={std:.3f}", file=sys.stderr)
+    print(f"Labels: mean={normed.mean():.3f}  std={normed.std():.3f}  "
+          f"min={normed.min():.3f}  max={normed.max():.3f}", file=sys.stderr)
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--horizon", type=int, default=20)
+    p.add_argument("--gamma",       type=float, default=0.99)
+    p.add_argument("--death-value", type=float, default=-20.0)
     args = p.parse_args()
-    label(args.horizon)
+    label(args.gamma, args.death_value)
 
 
 if __name__ == "__main__":

@@ -35,7 +35,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
         global _mode
         length = int(self.headers.get('Content-Length', 0))
         body = json.loads(self.rfile.read(length)) if length else {}
-        if self.path == '/mode':
+        if self.path == '/':
             new_mode = body.get('mode', '')
             if new_mode in ('model', 'survival', 'value'):
                 _mode = new_mode
@@ -95,10 +95,18 @@ async def ws_handler(websocket):
         session = Session(runtime)
     print(f"[server] new connection — mode={_mode}")
 
+    episode_buf = []
+
     async for message in websocket:
         try:
             state_d = json.loads(message)
-            _log(json.dumps(state_d))
+            if not state_d:
+                for frame in episode_buf:
+                    _log(frame)
+                _log(json.dumps(state_d))
+                episode_buf.clear()
+            else:
+                episode_buf.append(json.dumps(state_d))
             await websocket.send(json.dumps(session.handle_message(state_d)))
 
         except Exception as e:

@@ -7,6 +7,7 @@
 // @match        http://slither.io/*
 // @grant        none
 // ==/UserScript==
+$ = q => document.querySelector(q)
 
 function post(path, data){
     const xhr = new XMLHttpRequest()
@@ -17,13 +18,13 @@ function post(path, data){
 }
 
 window.bot = {
-    active: false,
+    active: true,
     dead: false,
     toggle: ()=>{
         window.bot.active = !window.bot.active
     },
     interval: null,
-    behavior: 0,
+    behavior: 1,
     counter: 0,
     t0: 0,
 
@@ -49,29 +50,29 @@ bot.connect = ()=>{
     console.log('Connecting to inference server ' + bot.ws_server)
     bot.ws = new WebSocket(bot.ws_server);
     bot.ws.onclose = () =>{
-        if(bot.behavior == 1 && bot.active && !bot.dead)
+        if(bot.behavior == 1 && bot.active)
             setTimeout(bot.connect, 1000);
     }
 
     bot.ws.onmessage = e => {
         const [norm_angle, boost, time] = JSON.parse(e.data)
-        const angle = norm_angle * Math.PI
+        const angle = -norm_angle * Math.PI
         window.xm = Math.cos(angle) * 100
         window.ym = Math.sin(angle) * 100
         setAcceleration(boost)
+        bot.counter += 1
         if(!(bot.counter % 10)) {
             const now = new Date().getTime()
-            console.log(angle, boost, slither.ang, slither.wang, now - time)
+            console.log(norm_angle, angle, boost, slither.ang, slither.wang, now - bot.t0)
         }
-        bot.counter += 1
     }
 }
 bot.connect()
 
 bot.post_mortem = ()=>{
+    if(bot.active) window.want_play = 1
     if(bot.dead || bot.behavior != 1) return
     bot.ws.send('[]')
-    window.want_play = 1
     bot.dead = true
 }
 
@@ -87,10 +88,7 @@ bot.get_record = me =>{
     }
 
     const get_props = s =>{
-        const angle_d = angleSub(s.wang, s.ang)
-        const dir = angle_d < 0 ? -1 : (angle_d > 0 ? 1 : 0)
-
-        var data = [dir, norm_angle(s.ang), +(s.sp > 5.8), s.sc]
+        var data = [norm_angle(s.wang), norm_angle(s.ang), +(s.sp > 5.8), s.sc]
         data = data.concat(rel_polar(s.xx, s.yy))
 
         const skip = Math.max(1, Math.floor(s.pts.length / 30))
@@ -106,7 +104,15 @@ bot.get_record = me =>{
         if(d < 650) food_dat.push([f.sz, a, d])
     })
 
-    return [me.sct + me.fam, food_dat, get_props(me), slithers.filter(s => s != me).map(get_props)]
+    me_props = get_props(me)
+    const world_ang = Math.atan2(me.yy - window.grd, me.xx - window.grd)
+    const edge_x = Math.cos(world_ang) * window.flux_grd + window.grd
+    const edge_y = Math.sin(world_ang) * window.flux_grd + window.grd
+    const edge_xd = me.xx - edge_x, edge_yd = me.yy - edge_y
+    me_props[4] = norm_angle(world_ang)
+    me_props[5] = Math.sqrt(edge_xd * edge_xd + edge_yd * edge_yd)
+
+    return [me.sct + me.fam, food_dat, me_props, slithers.filter(s => s != me).map(get_props)]
 }
 
 bot.behaviors = [
@@ -184,7 +190,11 @@ window.onkeydown = ev =>{
 window.clearInterval(bot.interval); bot.interval = setInterval(()=>{
     const me = window.slither
     if(!bot.active) return
-    if(!me || me.dead) { bot.post_mortem(); return }
+    if(!me || me.dead) {
+        bot.post_mortem()
+        if(!$('#nick').value) $('#nick').value = 'tasty (bot)'
+        return
+    }
 
     bot.behaviors[bot.behavior](me)
 }, 200);

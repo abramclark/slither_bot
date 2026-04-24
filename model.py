@@ -32,6 +32,7 @@ FOOD_START_INDEX = 4   # own_meta occupies indices 0-3
 FOOD_END_INDEX = FOOD_START_INDEX + K_FOOD * 3
 AVOID_ANGLE_INDEX = FOOD_END_INDEX # nearest segment angle of nearest snake
 AVOID_DIST_INDEX  = AVOID_ANGLE_INDEX + 1
+OWN_SEGMENTS_INDEX = IN_DIM - K_SEGMENTS * 2
 IS_AVOIDING_INDEX = IN_DIM
 
 AVOID_FOCUS_IN = 3               # heading + avoid_angle + avoid_dist
@@ -57,11 +58,9 @@ def make_flat_input(food, own_meta, own_body, snakes_meta, snakes_body):
     food_flat = np.zeros(K_FOOD * 3, dtype=np.float32)
     if len(food) > 0:
         snake_scale = own_meta[3]
-        big_food = food[food[:, 0].argsort()][-K_FOOD:]
-        valid = big_food[big_food[:, 2] > 50 * snake_scale]
-        if len(valid) > 0:
-            valid = valid[(valid[:, 2] / valid[:, 0]).argsort()]
-            food_flat[:len(valid) * 3] = valid.flatten()
+        food = food[food[:, 0].argsort()][-K_FOOD:]
+        food = food[(food[:, 2] / food[:, 0]).argsort()]
+        food_flat[:len(food) * 3] = food.flatten()
 
     nearest_seg_ixs = [s[:, 1].argmin() for s in snakes_body]
     smallest_dists = np.array([snakes_body[i][nearest_seg_ixs[i], 1] for i in range(len(snakes_body))])

@@ -2,74 +2,83 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from model import AVOID_ANGLE_INDEX, AVOID_DIST_INDEX, BOOST_INDEX, DIR_INDEX, HEADING_INDEX, IN_DIM
+from model import (AVOID_ANGLE_INDEX, AVOID_DIST_INDEX, BOOST_INDEX, DIR_INDEX,
+                   FOOD_START_INDEX, HEADING_INDEX, IN_DIM, FOOD_END_INDEX,
+                   K_FOOD, K_SNAKE, K_SEGMENTS, OWN_SEGMENTS_INDEX)
 
-CORE_INDICES = [DIR_INDEX, HEADING_INDEX, BOOST_INDEX, AVOID_ANGLE_INDEX, AVOID_DIST_INDEX]
-CORE_DIM     = len(CORE_INDICES)
+ACTION_INDICES  = [DIR_INDEX, HEADING_INDEX, BOOST_INDEX]
+CORE_INDICES    = ACTION_INDICES + [
+    AVOID_ANGLE_INDEX, AVOID_DIST_INDEX, FOOD_START_INDEX + 1, FOOD_START_INDEX + 4,
+    OWN_SEGMENTS_INDEX, OWN_SEGMENTS_INDEX + 1 # first own segment is angle and distance to world edge
+]
+_core_set       = set(CORE_INDICES)
+FINE_INDICES    = [i for i in range(IN_DIM) if i not in _core_set]
 
-_core_set    = set(CORE_INDICES)
-FINE_INDICES = [i for i in range(IN_DIM) if i not in _core_set]
-FINE_DIM     = len(FINE_INDICES)
+BODY_FREEZE_INDICES = list(range(OWN_SEGMENTS_INDEX + 2, OWN_SEGMENTS_INDEX + K_SEGMENTS * 2))
 
 VALUE_SAVE_PATH = "value.pt"
 
 
 class ValueNet(nn.Module):
     """
-    Predicts V(t) = net_size_change - 0.053 * horizon - death_indicator.
+    Predicts V(t) = net_size_change - AVERAGE_VALUE * horizon - death_indicator.
 
-    Output is unbounded real-valued: positive means above-average growth with
-    low death risk; negative means below-average growth or imminent death.
-
-    Architecture mirrors SurvivalNet: core stream (5 death-predictive features)
-    plus fine residual (full context), with avoid_dist as a warm-start shortcut.
-    Fine output is zero-initialized so training starts from core predictions only.
+    Context features (all except dir/heading/boost) are processed through 3 layers,
+    then action features are concatenated and passed through 2 more layers.
+    This lets the network evaluate different headings/boosts against fixed context
+    without recomputing context representations.
     """
     def __init__(self):
         super().__init__()
-        self.core = nn.Sequential(
-            nn.Linear(CORE_DIM, 32), nn.Tanh(),
-            nn.Linear(32, 32),       nn.Tanh(),
-            nn.Linear(32, 1),
+        embed = IN_DIM * 2
+        self.head = nn.Sequential(
+            nn.Linear(IN_DIM, embed), nn.Tanh(),
+            nn.Linear(embed, embed),                nn.Tanh(),
+            nn.Linear(embed, embed),                nn.Tanh(),
+            nn.Linear(embed, embed),                nn.Tanh(),
+            nn.Linear(embed, 1),
         )
-        self.fine = nn.Sequential(
-            nn.Linear(FINE_DIM, 64), nn.Tanh(),
-            nn.Linear(64, 32),       nn.Tanh(),
-            nn.Linear(32, 1),
-        )
-        nn.init.zeros_(self.fine[-1].weight)
-        nn.init.zeros_(self.fine[-1].bias)
+
+        # Zero-init fine columns so training warm-starts from core features only
+        self.head[0].weight.data[:, FINE_INDICES] = 0
+        # Identity-init layers 2 and 3 so they start as pass-throughs
+        nn.init.eye_(self.head[2].weight); nn.init.zeros_(self.head[2].bias)
+        nn.init.eye_(self.head[4].weight); nn.init.zeros_(self.head[4].bias)
 
     def forward(self, x):
-        core_feat = x[:, CORE_INDICES]
-        fine_feat = x[:, FINE_INDICES]
-        return (self.core(core_feat) + self.fine(fine_feat)).squeeze(-1)
+        return self.head(x).squeeze(-1)
 
-    def act(self, x_fixed: np.ndarray, n_headings: int = 16, n_boost: int = 2):
-        """
-        Find the heading and boost that maximize predicted value given fixed context.
-
-        Returns: (heading: float in [-1,1], boost: int 0/1, predicted_value: float)
-        """
+    def sample(self, x_fixed: np.ndarray):
+        """Evaluate 16 heading offsets × 2 boosts = 32 candidates and return all"""
         device = next(self.parameters()).device
 
-        headings = torch.linspace(-1.0, 1.0, n_headings, device=device)
-        boosts   = torch.arange(n_boost, dtype=torch.float32, device=device)
+        offsets = torch.linspace(-1, 1 - 1/8, 16, device=device)
+        current_heading = float(x_fixed[HEADING_INDEX])
+        turn_angles = (offsets + current_heading + 1.) % 2. - 1.
+
+        # 22 candidates: each heading/dir pair × boost 0 and 1
+        hh = turn_angles.repeat_interleave(2)
+        bb = torch.tensor([0., 1.], device=device).repeat(16)
 
         x_base = torch.from_numpy(x_fixed).float().to(device)
-        batch  = x_base.unsqueeze(0).expand(n_headings * n_boost, -1).clone()
-
-        hh = headings.repeat_interleave(n_boost)
-        bb = boosts.repeat(n_headings)
+        batch  = x_base.unsqueeze(0).expand(32, -1).clone()
+        batch[:, DIR_INDEX]     = hh
         batch[:, HEADING_INDEX] = hh
         batch[:, BOOST_INDEX]   = bb
 
         with torch.no_grad():
-            vals = self(batch)
+            return self(batch), hh, bb
 
-        best_idx     = vals.argmax().item()
-        best_heading = hh[best_idx].item()
-        best_boost   = int(bb[best_idx].item())
-        best_val     = vals[best_idx].item()
+    def act(self, x_fixed: np.ndarray):
+        """Returns: (heading: float in [-1,1], boost: int 0/1, predicted_value: float)"""
+        vals, hh, bb = self.sample(x_fixed)
 
-        return best_heading, best_boost, best_val
+        # Shape: (16 headings, 2 boosts); headings are circular
+        vals_2d = vals.view(16, 2)
+        heading_scores = vals_2d.max(dim=1).values  # best boost per heading
+        smoothed = (heading_scores.roll(1) + heading_scores + heading_scores.roll(-1))
+
+        best_hi  = smoothed.argmax().item()
+        best_bi  = vals_2d[best_hi].argmax().item()
+
+        return hh[best_hi * 2].item(), best_bi, vals_2d[best_hi, best_bi].item()

@@ -141,6 +141,7 @@ class ValueSession:
 
         x = get_flat(state_d).astype(np.float32)
         game_dir, boost, val = self.runtime.model.act(x)
+        if state_d[0] < 3: boost = 0 # prevent reinforcing boost when to small
         print(f"[value] dir={game_dir:.3f}  boost={boost}  val={val:.3f}")
         return [game_dir, boost, time() * 1000]
 

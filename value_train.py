@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Train ValueNet to predict V(t) = size_gain - 0.053 * horizon - death_indicator.
+Train ValueNet to predict V(t) = size_gain - AVERAGE_VALUE * horizon - death_indicator.
 
 Generate labels first:
     python label_value.py < experience-t0.jsonl > value_labels.npy
@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 
 from model import get_flat
-from value_model import VALUE_SAVE_PATH, ValueNet
+from value_model import VALUE_SAVE_PATH, ValueNet, FINE_INDICES, BODY_FREEZE_INDICES
 
 
 def load_data(experience_path, labels_path, start, count):
@@ -87,7 +87,28 @@ def train(args):
     sx = torch.from_numpy(states).to(device)
     sy = torch.from_numpy(targets).to(device)
 
-    optimizer  = torch.optim.Adam(model.parameters(), lr=args.lr)
+    if args.freeze_mid:
+        for p in model.head[2].parameters(): p.requires_grad = False
+        for p in model.head[4].parameters(): p.requires_grad = False
+        print("Frozen: head[2], head[4]")
+
+    if args.freeze_fine:
+        def _zero_fine_grads(grad):
+            grad = grad.clone()
+            grad[:, FINE_INDICES] = 0
+            return grad
+        model.head[0].weight.register_hook(_zero_fine_grads)
+        print(f"Frozen: head[0] fine columns ({len(FINE_INDICES)} of {model.head[0].weight.shape[1]})")
+
+    if args.freeze_body:
+        def _zero_body_grads(grad):
+            grad = grad.clone()
+            grad[:, BODY_FREEZE_INDICES] = 0
+            return grad
+        model.head[0].weight.register_hook(_zero_body_grads)
+        print(f"Frozen: head[0] body columns ({len(BODY_FREEZE_INDICES)} of {model.head[0].weight.shape[1]})")
+
+    optimizer  = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
     n          = len(states)
     batch_size = min(args.batch_size, n)
 
@@ -121,7 +142,7 @@ def train(args):
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--experience",  default="experience-t0.jsonl")
+    p.add_argument("--experience",  default="old-experience.jsonl")
     p.add_argument("--labels",      default="value_labels.npy")
     p.add_argument("--start",       type=int,   default=0)
     p.add_argument("--count",       type=int,   default=None)
@@ -129,6 +150,9 @@ def parse_args():
     p.add_argument("--batch-size",  type=int,   default=256)
     p.add_argument("--lr",          type=float, default=1e-3)
     p.add_argument("--grad-clip",   type=float, default=1.0)
+    p.add_argument("--freeze-mid",  action="store_true")
+    p.add_argument("--freeze-fine", action="store_true")
+    p.add_argument("--freeze-body", action="store_true")
     p.add_argument("--model-path",  default=VALUE_SAVE_PATH)
     return p.parse_args()
 
