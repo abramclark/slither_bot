@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import queue
+import random
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -16,7 +17,8 @@ LOG_PATH  = "experience.jsonl"
 
 _debug_queue = queue.Queue()
 _debug_done  = threading.Event()
-_mode = 'value'  # 'model', 'survival', or 'value'
+_mode     = 'value'  # 'model', 'survival', or 'value'
+_no_boost = random.random() < 0.5
 
 
 def _debug_worker():
@@ -32,22 +34,38 @@ def _debug_worker():
 
 class _ControlHandler(BaseHTTPRequestHandler):
     def do_POST(self):
-        global _mode
+        global _mode, _no_boost
         length = int(self.headers.get('Content-Length', 0))
         body = json.loads(self.rfile.read(length)) if length else {}
         if self.path == '/':
-            new_mode = body.get('mode', '')
-            if new_mode in ('model', 'survival', 'value'):
-                _mode = new_mode
-                print(f"[server] mode → {_mode}")
-                self.send_response(200)
-                self.send_header('Content-Type', 'application/json')
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.end_headers()
-                self.wfile.write(json.dumps({'mode': _mode}).encode())
-            else:
-                self.send_response(400)
-                self.end_headers()
+            if 'mode' in body:
+                if body['mode'] in ('model', 'survival', 'value'):
+                    _mode = body['mode']
+                    print(f"[server] mode → {_mode}")
+                else:
+                    self.send_response(400)
+                    self.end_headers()
+                    return
+            if 'no_boost' in body:
+                _no_boost = bool(body['no_boost'])
+                print(f"[server] no_boost → {_no_boost}")
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(json.dumps({'mode': _mode, 'no_boost': _no_boost}).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_GET(self):
+        if self.path == '/':
+            body = json.dumps({'mode': _mode, 'no_boost': _no_boost}).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_response(404)
             self.end_headers()
@@ -68,6 +86,7 @@ threading.Thread(
 runtime          = get_runtime()
 survival_runtime = get_survival_runtime()
 value_runtime    = get_value_runtime()
+print(f"[server] no_boost={_no_boost}")
 
 
 def _log(line):
@@ -87,13 +106,14 @@ _log_file = open(LOG_PATH, "a")
 
 
 async def ws_handler(websocket):
+    global _no_boost
     if _mode == 'survival':
         session = SurvivalSession(survival_runtime)
     elif _mode == 'value':
         session = ValueSession(value_runtime)
     else:
         session = Session(runtime)
-    print(f"[server] new connection — mode={_mode}")
+    print(f"[server] new connection — mode={_mode}  no_boost={_no_boost}")
 
     episode_buf = []
 
@@ -105,9 +125,14 @@ async def ws_handler(websocket):
                     _log(frame)
                 _log(json.dumps(state_d))
                 episode_buf.clear()
+                _no_boost = random.random() < 0.5
+                print(f"[server] DEAD — no_boost → {_no_boost}\n")
             else:
                 episode_buf.append(json.dumps(state_d))
-            await websocket.send(json.dumps(session.handle_message(state_d)))
+            response = session.handle_message(state_d)
+            if _no_boost and response:
+                response[1] = 0
+            await websocket.send(json.dumps(response))
 
         except Exception as e:
             import traceback, sys

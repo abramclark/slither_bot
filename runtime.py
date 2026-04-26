@@ -69,7 +69,6 @@ class Session:
 
     def handle_message(self, state_d):
         if not state_d:
-            print("DEAD\n")
             return [0, 0]
 
         x = get_flat(state_d)
@@ -101,7 +100,6 @@ class SurvivalSession:
 
     def handle_message(self, state_d):
         if not state_d:
-            print("DEAD (survival)\n")
             return [0, 0]
 
         x = get_flat(state_d).astype(np.float32)
@@ -136,7 +134,6 @@ class ValueSession:
 
     def handle_message(self, state_d):
         if not state_d:
-            print("DEAD (value)\n")
             return [0, 0]
 
         x = get_flat(state_d).astype(np.float32)

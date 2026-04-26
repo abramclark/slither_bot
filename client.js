@@ -30,6 +30,7 @@ window.bot = {
 
     boost_threshold: 10,
     avoid_dist: 300,
+    last_boost: null,
 
     ws_server: 'ws://localhost:9002',
     ws: null,
@@ -56,10 +57,10 @@ bot.connect = ()=>{
 
     bot.ws.onmessage = e => {
         const [norm_angle, boost, time] = JSON.parse(e.data)
-        const angle = -norm_angle * Math.PI
+        const angle = norm_angle * Math.PI
         window.xm = Math.cos(angle) * 100
         window.ym = Math.sin(angle) * 100
-        setAcceleration(boost)
+        if(boost !== bot.last_boost) { setAcceleration(boost); bot.last_boost = boost }
         bot.counter += 1
         if(!(bot.counter % 10)) {
             const now = new Date().getTime()
@@ -70,10 +71,11 @@ bot.connect = ()=>{
 bot.connect()
 
 bot.post_mortem = ()=>{
-    if(bot.active) window.want_play = 1
     if(bot.dead || bot.behavior != 1) return
-    bot.ws.send('[]')
     bot.dead = true
+    if(bot.ws.readyState === WebSocket.OPEN) bot.ws.send('[]')
+    // wait for game server socket to close before restarting
+    if(bot.active) setTimeout(() => { window.want_play = 1 }, 1000)
 }
 
 bot.get_record = me =>{
