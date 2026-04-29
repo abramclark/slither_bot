@@ -29,7 +29,7 @@ window.bot = {
     t0: 0,
 
     boost_threshold: 10,
-    avoid_dist: 300,
+    avoid_dist: 250,
     last_boost: null,
 
     ws_server: 'ws://localhost:9002',
@@ -56,15 +56,14 @@ bot.connect = ()=>{
     }
 
     bot.ws.onmessage = e => {
-        const [norm_angle, boost, time] = JSON.parse(e.data)
-        const angle = norm_angle * Math.PI
+        const [angle, boost] = JSON.parse(e.data)
         window.xm = Math.cos(angle) * 100
         window.ym = Math.sin(angle) * 100
         if(boost !== bot.last_boost) { setAcceleration(boost); bot.last_boost = boost }
         bot.counter += 1
         if(!(bot.counter % 10)) {
             const now = new Date().getTime()
-            console.log(norm_angle, angle, boost, slither.ang, slither.wang, now - bot.t0)
+            console.log(angle, boost, now - bot.t0)
         }
     }
 }
@@ -79,31 +78,24 @@ bot.post_mortem = ()=>{
 }
 
 bot.get_record = me =>{
-    const norm_angle = a =>{
-        a = a / Math.PI
-        return a < 1 ? a : -(1 - a % 1)
-    }
-
-    const rel_polar = (x, y)=>{
-        const dx = x - me.xx, dy = y - me.yy
-        return [Math.atan2(dy, dx) / Math.PI, Math.sqrt(dx * dx + dy * dy)]
-    }
+    const relc = (x, y)=> [x - me.xx, y - me.yy]
 
     const get_props = s =>{
-        var data = [norm_angle(s.wang), norm_angle(s.ang), +(s.sp > 5.8), s.sc]
-        data = data.concat(rel_polar(s.xx, s.yy))
+        var data = [s.wang, s.ang, s.sp / 14, s.sc]
+        data = data.concat(relc(s.xx, s.yy))
 
         const skip = Math.max(1, Math.floor(s.pts.length / 30))
         for(let i = 0; i < s.pts.length; i += skip)
-            data = data.concat(rel_polar(s.pts[i].xx, s.pts[i].yy))
+            data = data.concat(relc(s.pts[i].xx, s.pts[i].yy))
         return data
     }
 
     const food_dat = []
     const fs = foods.filter(f =>{
         if(!f) return
-        const [a, d] = rel_polar(f.xx, f.yy)
-        if(d < 650) food_dat.push([f.sz, a, d])
+        const [x, y] = relc(f.xx, f.yy)
+        const d = Math.sqrt(x * x + y * y)
+        if(d < 700) food_dat.push([f.sz / 14, x, y])
     })
 
     me_props = get_props(me)
@@ -111,8 +103,8 @@ bot.get_record = me =>{
     const edge_x = Math.cos(world_ang) * window.flux_grd + window.grd
     const edge_y = Math.sin(world_ang) * window.flux_grd + window.grd
     const edge_xd = me.xx - edge_x, edge_yd = me.yy - edge_y
-    me_props[4] = norm_angle(world_ang)
-    me_props[5] = Math.sqrt(edge_xd * edge_xd + edge_yd * edge_yd)
+    me_props[4] = edge_xd
+    me_props[5] = edge_yd
 
     return [me.sct + me.fam, food_dat, me_props, slithers.filter(s => s != me).map(get_props)]
 }

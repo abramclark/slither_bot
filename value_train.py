@@ -18,7 +18,15 @@ import torch
 import torch.nn as nn
 
 from model import get_flat
-from value_model import VALUE_SAVE_PATH, ValueNet, FINE_INDICES, BODY_FREEZE_INDICES
+from value_model import ValueNet, FINE_INDICES, BODY_FREEZE_INDICES, FOOD_FREEZE_INDICES
+from value2_model import Value2Net
+import value_model  as _vm1
+import value2_model as _vm2
+
+MODEL_REGISTRY = {
+    'value':  (_vm1, ValueNet),
+    'value2': (_vm2, Value2Net),
+}
 
 
 def load_data(experience_path, labels_path, start, count):
@@ -71,12 +79,12 @@ def load_data(experience_path, labels_path, start, count):
 
 
 def train(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model  = ValueNet().to(device)
+    mod, model_cls = MODEL_REGISTRY[args.model]
+    model = model_cls()
 
     resume_ep = 0
     try:
-        ckpt = torch.load(args.model_path, map_location=device, weights_only=True)
+        ckpt = torch.load(args.model_path, map_location="cpu", weights_only=True)
         model.load_state_dict(ckpt["model"])
         resume_ep = ckpt.get("ep", 0)
         print(f"Resumed from {args.model_path} (ep={resume_ep})")
@@ -84,13 +92,13 @@ def train(args):
         print("Starting fresh")
 
     states, targets, _ = load_data(args.experience, args.labels, args.start, args.count)
-    sx = torch.from_numpy(states).to(device)
-    sy = torch.from_numpy(targets).to(device)
+    sx = torch.from_numpy(states)
+    sy = torch.from_numpy(targets)
 
     if args.freeze_mid:
-        for p in model.head[2].parameters(): p.requires_grad = False
-        for p in model.head[4].parameters(): p.requires_grad = False
-        print("Frozen: head[2], head[4]")
+        for i in mod.MID_LAYERS:
+            for p in model.head[i].parameters(): p.requires_grad = False
+            print(f"Frozen: head[{i}]")
 
     if args.freeze_fine:
         def _zero_fine_grads(grad):
@@ -108,20 +116,39 @@ def train(args):
         model.head[0].weight.register_hook(_zero_body_grads)
         print(f"Frozen: head[0] body columns ({len(BODY_FREEZE_INDICES)} of {model.head[0].weight.shape[1]})")
 
-    optimizer  = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
+    if args.freeze_food:
+        def _zero_food_grads(grad):
+            grad = grad.clone()
+            grad[:, FOOD_FREEZE_INDICES] = 0
+            return grad
+        model.head[0].weight.register_hook(_zero_food_grads)
+        print(f"Frozen: head[0] food columns ({len(FOOD_FREEZE_INDICES)} of {model.head[0].weight.shape[1]})")
+
+    optimizer  = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=args.lr, weight_decay=args.decay
+    )
     n          = len(states)
     batch_size = min(args.batch_size, n)
 
-    print(f"Device: {device}  n={n}  batch={batch_size}")
+    noise_mask = torch.ones(sx.shape[1], dtype=torch.bool)
+    noise_mask[mod.ACTION_INDICES] = False
+
+    print(f"n={n}  batch={batch_size}  noise_factor={args.noise_factor}")
     print(f"{'Epoch':>5}  {'loss':>8}  {'mae':>8}")
     for epoch in range(args.epochs):
         model.train()
-        idx      = torch.randperm(n, device=device)
+        idx      = torch.randperm(n)
         loss_sum = 0.0
         batches  = 0
         for start in range(0, n - batch_size + 1, batch_size):
-            mb   = idx[start:start + batch_size]
-            pred = model(sx[mb])
+            mb    = idx[start:start + batch_size]
+            batch = sx[mb]
+            if args.noise_factor:
+                noise = torch.zeros_like(batch)
+                noise[:, noise_mask] = torch.randn(len(mb), noise_mask.sum().item()) * args.noise_factor
+                batch = batch + noise
+            pred = model(batch)
             loss = nn.functional.mse_loss(pred, sy[mb])
             optimizer.zero_grad()
             loss.backward()
@@ -149,12 +176,19 @@ def parse_args():
     p.add_argument("--epochs",      type=int,   default=20)
     p.add_argument("--batch-size",  type=int,   default=256)
     p.add_argument("--lr",          type=float, default=1e-3)
+    p.add_argument("--decay",       type=float, default=1e-4)
     p.add_argument("--grad-clip",   type=float, default=1.0)
     p.add_argument("--freeze-mid",  action="store_true")
     p.add_argument("--freeze-fine", action="store_true")
     p.add_argument("--freeze-body", action="store_true")
-    p.add_argument("--model-path",  default=VALUE_SAVE_PATH)
-    return p.parse_args()
+    p.add_argument("--freeze-food",   action="store_true")
+    p.add_argument("--noise-factor",  type=float, default=0.0)
+    p.add_argument("--model",       choices=['value', 'value2'], default='value')
+    p.add_argument("--model-path",  default=None)
+    args = p.parse_args()
+    if args.model_path is None:
+        args.model_path = MODEL_REGISTRY[args.model][1].save_path
+    return args
 
 
 if __name__ == "__main__":

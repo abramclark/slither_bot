@@ -7,6 +7,7 @@ from model import (AVOIDX_INDEX, DIRX_INDEX, BOOST_INDEX, FOOD_START_INDEX, HEAD
 
 SAMPLE_COUNT = 16
 ACTION_SCALAR   = 10
+CORE_SCALAR     = 1
 ACTION_INDICES  = [DIRX_INDEX, DIRX_INDEX + 1, HEADINGX_INDEX, HEADINGX_INDEX + 1, BOOST_INDEX]
 CORE_INDICES    = ACTION_INDICES + [
     AVOIDX_INDEX, AVOIDX_INDEX + 1, FOOD_START_INDEX + 1, FOOD_START_INDEX + 2,
@@ -24,7 +25,7 @@ MID_LAYERS = [6, 9]
 def to_core(x): return x[..., CORE_INDICES]
 
 
-class ValueNet(nn.Module):
+class Value2Net(nn.Module):
     """
     Predicts V(t) = net_size_change - AVERAGE_VALUE * horizon - death_indicator.
 
@@ -33,7 +34,7 @@ class ValueNet(nn.Module):
     This lets the network evaluate different headings/boosts against fixed context
     without recomputing context representations.
     """
-    save_path = "value.pt"
+    save_path = 'value2.pt'
 
     def __init__(self):
         super().__init__()
@@ -51,7 +52,7 @@ class ValueNet(nn.Module):
 
         # Zero-init fine columns so training warm-starts from core features only
         self.head[0].weight.data[:, FINE_INDICES] = 0
-        # Identity-init MID_LAYERS so they start as pass-throughs to prevent over-fitting
+        # Init MID_LAYERS as near pass-through / identity to prevent over-fitting
         for i in MID_LAYERS:
             weights = self.head[i].weight
             nn.init.eye_(weights)
@@ -61,6 +62,7 @@ class ValueNet(nn.Module):
     def forward(self, x):
         x = x.clone()
         x[:, ACTION_INDICES] *= ACTION_SCALAR
+        x[:, CORE_INDICES]   *= CORE_SCALAR
         return self.head(x).squeeze(-1)
 
     def sample(self, x_fixed: np.ndarray):

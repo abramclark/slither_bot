@@ -7,9 +7,14 @@ import random
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import numpy as np
+import torch
 import websockets
 
-from runtime import Session, SurvivalSession, ValueSession, get_runtime, get_survival_runtime, get_value_runtime
+from model import get_flat, bot_script
+from time import time
+from value_model import ValueNet
+from value2_model import Value2Net
 
 WS_PORT   = 9002
 HTTP_PORT = 9001
@@ -17,8 +22,13 @@ LOG_PATH  = "experience.jsonl"
 
 _debug_queue = queue.Queue()
 _debug_done  = threading.Event()
-_mode     = 'value'  # 'model', 'survival', or 'value'
-_no_boost = random.random() < 0.5
+_no_boost        = False  # True / False / 'random'
+_no_boost_active = random.random() < 0.5
+
+
+def _roll_no_boost():
+    global _no_boost_active
+    _no_boost_active = random.random() < 0.5 if _no_boost == 'random' else bool(_no_boost)
 
 
 def _debug_worker():
@@ -39,7 +49,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length)) if length else {}
         if self.path == '/':
             if 'mode' in body:
-                if body['mode'] in ('model', 'survival', 'value'):
+                if body['mode'] in ('value', 'value2', 'script', 'record'):
                     _mode = body['mode']
                     print(f"[server] mode → {_mode}")
                 else:
@@ -47,7 +57,9 @@ class _ControlHandler(BaseHTTPRequestHandler):
                     self.end_headers()
                     return
             if 'no_boost' in body:
-                _no_boost = bool(body['no_boost'])
+                val = body['no_boost']
+                _no_boost = 'random' if val == 'random' else bool(val)
+                _roll_no_boost()
                 print(f"[server] no_boost → {_no_boost}")
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
@@ -60,7 +72,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == '/':
-            body = json.dumps({'mode': _mode, 'no_boost': _no_boost}).encode()
+            body = json.dumps({'mode': _mode, 'no_boost': _no_boost, 'no_boost_current': _no_boost_active}).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
@@ -74,21 +86,11 @@ class _ControlHandler(BaseHTTPRequestHandler):
         pass  # suppress per-request logs
 
 
-threading.Thread(target=_debug_worker, daemon=True).start()
 class _ReuseHTTPServer(HTTPServer):
     allow_reuse_address = True
 
-threading.Thread(
-    target=lambda: _ReuseHTTPServer(('', HTTP_PORT), _ControlHandler).serve_forever(),
-    daemon=True,
-).start()
 
-runtime          = get_runtime()
-survival_runtime = get_survival_runtime()
-value_runtime    = get_value_runtime()
-print(f"[server] no_boost={_no_boost}")
-
-
+_log_file = open(LOG_PATH, "a")
 def _log(line):
     """Append a line to the log, reopening the file if it has been moved or deleted."""
     global _log_file
@@ -102,17 +104,46 @@ def _log(line):
     _log_file.flush()
 
 
-_log_file = open(LOG_PATH, "a")
+class ValueRuntime:
+    def __init__(self, model_cls):
+        save_path = model_cls.save_path
+        self.tag = model_cls.__name__
+        self.model = model_cls()
+        try:
+            ckpt = torch.load(save_path, weights_only=True)
+            self.model.load_state_dict(ckpt["model"])
+            ep = ckpt.get("ep", 0)
+            print(f"{self.tag}: resumed from {save_path} (ep={ep})")
+        except FileNotFoundError:
+            print(f"{self.tag}: no checkpoint at {save_path}, starting fresh")
+        self.model.eval()
+
+    def handle_message(self, state_d):
+        if not state_d:
+            return [0, 0]
+        x = get_flat(state_d).astype(np.float32)
+        game_dir, boost, val = self.model.act(x)
+        if state_d[0] < 3: boost = 0
+        print(f"[{self.tag}] dir={game_dir:.3f}  boost={boost}  val={val:.3f}")
+        return [game_dir, boost]
+
+
+_value_runtime = _value2_runtime = None
+def value_act(state):  return _value_runtime.handle_message(state)
+def value2_act(state): return _value2_runtime.handle_message(state)
+
+
+_mode = 'value'
+modes = dict(
+    value=value_act,
+    value2=value2_act,
+    script=lambda s: bot_script(s)[:2],
+    record=lambda f: [-1, 0],
+)
 
 
 async def ws_handler(websocket):
     global _no_boost
-    if _mode == 'survival':
-        session = SurvivalSession(survival_runtime)
-    elif _mode == 'value':
-        session = ValueSession(value_runtime)
-    else:
-        session = Session(runtime)
     print(f"[server] new connection — mode={_mode}  no_boost={_no_boost}")
 
     episode_buf = []
@@ -125,12 +156,12 @@ async def ws_handler(websocket):
                     _log(frame)
                 _log(json.dumps(state_d))
                 episode_buf.clear()
-                _no_boost = random.random() < 0.5
-                print(f"[server] DEAD — no_boost → {_no_boost}\n")
+                _roll_no_boost()
+                print(f"[server] DEAD — no_boost={_no_boost} active={_no_boost_active}\n")
             else:
                 episode_buf.append(json.dumps(state_d))
-            response = session.handle_message(state_d)
-            if _no_boost and response:
+            response = modes[_mode](state_d)
+            if _no_boost_active and response:
                 response[1] = 0
             await websocket.send(json.dumps(response))
 
@@ -151,20 +182,32 @@ async def run_ws():
 
 
 def main():
+    global _value_runtime, _value2_runtime
+    _value_runtime  = ValueRuntime(ValueNet)
+    _value2_runtime = ValueRuntime(Value2Net)
+
+    threading.Thread(target=_debug_worker, daemon=True).start()
+
+    threading.Thread(
+        target=lambda: _ReuseHTTPServer(('', HTTP_PORT), _ControlHandler).serve_forever(),
+        daemon=True,
+    ).start()
+
     asyncio.run(run_ws())
 
 
 if __name__ == "__main__":
     import sys, subprocess
+    print(f"[server] no_boost={_no_boost}")
     if "--no-reload" in sys.argv:
         main()
     else:
         from watchfiles import watch
         cmd = [sys.executable, __file__, "--no-reload"]
         proc = subprocess.Popen(cmd)
+        watch_paths = [p for p in [__file__, "model.py", "value_model.py", "value2_model.py", "value.pt", "value2.pt"] if os.path.exists(p)]
         try:
-            for _ in watch(__file__, "model.py", "runtime.py", "survival_model.py", "value_model.py",
-                           "model.pt", "survival.pt", "value.pt"):
+            for _ in watch(*watch_paths):
                 print("File changed — restarting...")
                 proc.terminate()
                 try:
@@ -174,4 +217,11 @@ if __name__ == "__main__":
                     proc.wait()
                 proc = subprocess.Popen(cmd)
         except KeyboardInterrupt:
+            pass
+        finally:
             proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()

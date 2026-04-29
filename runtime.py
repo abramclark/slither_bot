@@ -113,39 +113,8 @@ class SurvivalSession:
         print(f"[survival] EVADE dir={game_dir:.3f}  boost={boost}  val={val:.3f}")
         return [game_dir, boost, time() * 1000]
 
-
-class ValueRuntime:
-    def __init__(self):
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = ValueNet().to(self.device)
-        try:
-            ckpt = torch.load(VALUE_SAVE_PATH, map_location=self.device, weights_only=True)
-            self.model.load_state_dict(ckpt["model"])
-            ep = ckpt.get("ep", 0)
-            print(f"Value: resumed from {VALUE_SAVE_PATH} (ep={ep})")
-        except FileNotFoundError:
-            print(f"Value: no checkpoint at {VALUE_SAVE_PATH}, starting fresh")
-        self.model.eval()
-
-
-class ValueSession:
-    def __init__(self, runtime: ValueRuntime):
-        self.runtime = runtime
-
-    def handle_message(self, state_d):
-        if not state_d:
-            return [0, 0]
-
-        x = get_flat(state_d).astype(np.float32)
-        game_dir, boost, val = self.runtime.model.act(x)
-        if state_d[0] < 3: boost = 0 # prevent reinforcing boost when to small
-        print(f"[value] dir={game_dir:.3f}  boost={boost}  val={val:.3f}")
-        return [game_dir, boost, time() * 1000]
-
-
 _runtime = None
 _survival_runtime = None
-_value_runtime = None
 
 
 def get_runtime():
@@ -162,8 +131,3 @@ def get_survival_runtime():
     return _survival_runtime
 
 
-def get_value_runtime():
-    global _value_runtime
-    if _value_runtime is None:
-        _value_runtime = ValueRuntime()
-    return _value_runtime

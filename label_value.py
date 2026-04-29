@@ -17,7 +17,7 @@ import sys
 import numpy as np
 
 
-def label(gamma, death_value):
+def label(gamma, death_value, no_growth=False, no_death=False, death_offset=3):
     lines = []
     for raw in sys.stdin:
         raw = raw.strip()
@@ -52,7 +52,7 @@ def label(gamma, death_value):
               for t in range(len(episode) - 1)]
     avg_value = float(np.mean(deltas)) if deltas else 0.0
 
-    # Pass 1: alive-only returns (r=0 at terminal) for normalization stats
+    # Pass 1: life-only returns (r=0 at terminal) for normalization stats
     labels_alive = np.full(len(lines), np.nan, dtype=np.float32)
     for episode in episodes:
         T = len(episode)
@@ -67,12 +67,13 @@ def label(gamma, death_value):
     mean, std = float(alive_vals.mean()), float(alive_vals.std())
 
     # Pass 2: alive_norm (mean=1) + discounted death signal
+    # Frames within death_offset of the death marker are left as NaN.
     for episode in episodes:
         T = len(episode)
-        for t in range(T):
+        for t in range(T - death_offset):
             li, _ = episode[t]
-            alive_norm = (labels_alive[li] - mean) / (std + 1e-8) + 1.0
-            death_disc = death_value * (gamma ** (T - 1 - t))
+            alive_norm = 0.0 if no_growth else (labels_alive[li] - mean) / (std + 1e-8) + 1.0
+            death_disc = 0.0 if no_death else death_value * (gamma ** (T - death_offset - 1 - t))
             labels[li] = alive_norm + death_disc
 
     valid_mask = ~np.isnan(labels)
@@ -94,10 +95,13 @@ def label(gamma, death_value):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--gamma",       type=float, default=0.99)
-    p.add_argument("--death-value", type=float, default=-20.0)
+    p.add_argument("--gamma",        type=float, default=0.99)
+    p.add_argument("--death-value",  type=float, default=-20.0)
+    p.add_argument("--no-growth",    action="store_true")
+    p.add_argument("--no-death",     action="store_true")
+    p.add_argument("--death-offset", type=int, default=3)
     args = p.parse_args()
-    label(args.gamma, args.death_value)
+    label(args.gamma, args.death_value, args.no_growth, args.no_death, args.death_offset)
 
 
 if __name__ == "__main__":

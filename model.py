@@ -9,8 +9,10 @@ import torch.nn.functional as F
 K_FOOD = 10     # nearest food items to use
 K_SNAKE = 4     # nearest snakes to use
 K_SEGMENTS = 15 # examine K_SEGMENTS of snakes
+META_SIZE = 6   # [turn_x, turn_y, heading_x, heading_y, speed, scale]
+FOOD_SIZE = 1 + K_FOOD * 2
 
-IN_DIM = 4 + K_FOOD * 3 + K_SNAKE * (K_SEGMENTS + 1) * 2 + K_SNAKE * 4 + K_SEGMENTS * 2
+IN_DIM = META_SIZE + FOOD_SIZE + K_SNAKE * (K_SEGMENTS + 1) * 2 + K_SNAKE * META_SIZE + K_SEGMENTS * 2
 
 GAMMA = 0.99
 LAM = 0.95
@@ -25,65 +27,80 @@ REPLAY_SIZE = 2000
 
 SAVE_PATH = "model.pt"
 AVOID_DIST = 250
-DIR_INDEX     = 0       # own_meta[0] = turning direction
-HEADING_INDEX = 1       # own_meta[1] = heading angle
-BOOST_INDEX   = 2       # own_meta[2] = is boosting
-FOOD_START_INDEX = 4   # own_meta occupies indices 0-3
-FOOD_END_INDEX = FOOD_START_INDEX + K_FOOD * 3
-AVOID_ANGLE_INDEX = FOOD_END_INDEX # nearest segment angle of nearest snake
-AVOID_DIST_INDEX  = AVOID_ANGLE_INDEX + 1
+DIRX_INDEX       = 0 # own_meta[(0,1)] = turn to x, y
+HEADINGX_INDEX   = 2 # own_meta[(2,3)] = moving towards x, y
+BOOST_INDEX      = 4 # own_meta[4] = is speed (.413 to 1)
+FOOD_START_INDEX = 6 # own_meta occupies indices 0-5
+FOOD_END_INDEX = FOOD_START_INDEX + FOOD_SIZE
+AVOIDX_INDEX = FOOD_END_INDEX # nearest segment angle of nearest snake
 OWN_SEGMENTS_INDEX = IN_DIM - K_SEGMENTS * 2
-IS_AVOIDING_INDEX = IN_DIM
 
+# legacy constants
+IS_AVOIDING_INDEX = IN_DIM
 AVOID_FOCUS_IN = 3               # heading + avoid_angle + avoid_dist
 FOOD_FOCUS_IN  = 1 + K_FOOD * 3  # heading + K_FOOD food triplets
 
 
 def parse_record(d):
     own_size = float(d[0])
-    food = np.array(d[1], dtype=np.float32)          # (N, 3): [size, angle, dist]
+    food = np.array(d[1], dtype=np.float32)          # (N, 3): [size, x, y]
     self_data = d[2]
-    target_dir = float(self_data[0])
-    target_boost = float(self_data[2])
-    own_meta = np.array(self_data[0:4], dtype=np.float32)   # [dir, heading, boost, snake_scale]
-    own_body = np.array(self_data[6:], dtype=np.float32).reshape(-1, 2)
-    snakes_meta = [np.array(s[:4], dtype=np.float32) for s in d[3]]
+    own_body = np.array(self_data[4:], dtype=np.float32).reshape(-1, 2)
+    snakes_meta = [flat_meta(s) for s in d[3]]
     snakes_body = [np.array(s[4:], dtype=np.float32).reshape(-1, 2) for s in d[3]]
-    return own_size, food, own_meta, own_body, snakes_meta, snakes_body, target_dir, target_boost
+    return own_size, food, flat_meta(self_data), own_body, snakes_meta, snakes_body
+
+
+def flat_meta(d):
+    """Convert [turn_to, heading, speed, scale] to
+    [turn_x, turn_y, heading_x, heading_y, speed, scale]"""
+    v = np.empty(META_SIZE, dtype=np.float32)
+    v[:] = [np.cos(d[0]), np.sin(d[0]), np.cos(d[1]), np.sin(d[1]), d[2], d[3]]
+    return v
 
 
 def make_flat_input(food, own_meta, own_body, snakes_meta, snakes_body):
     # Mirror bot_script exactly: top-K by size, filter too-close food, sort by dist/size.
     # This guarantees the target angle is always at food_flat[1] (or heading if no valid food).
-    food_flat = np.zeros(K_FOOD * 3, dtype=np.float32)
+    food_flat = np.zeros(FOOD_SIZE, dtype=np.float32)
     if len(food) > 0:
-        snake_scale = own_meta[3]
         food = food[food[:, 0].argsort()][-K_FOOD:]
-        food = food[(food[:, 2] / food[:, 0]).argsort()]
-        food_flat[:len(food) * 3] = food.flatten()
+        food_flat[0] = np.sum(food[:, 0] >= 1)
+        coords = food.reshape(-1, 3)[:, 1:]
+        dists = np.linalg.norm(coords, axis=1)
+        food_flat[1:len(food) * 2 + 1] = coords[(dists / food[:, 0]).argsort()].flatten()
 
-    nearest_seg_ixs = [s[:, 1].argmin() for s in snakes_body]
-    smallest_dists = np.array([snakes_body[i][nearest_seg_ixs[i], 1] for i in range(len(snakes_body))])
+    snakes_dists = [np.linalg.norm(s, axis=1) for s in snakes_body]
+    nearest_seg_ixs = [dists.argmin() for dists in snakes_dists]
+    smallest_dists = np.array([dists[i] for i, dists in zip(nearest_seg_ixs, snakes_dists)])
     nearest_ixs = smallest_dists.argsort()[:K_SNAKE]
-    nearest_snakes = [np.concatenate([snakes_body[i][[nearest_seg_ixs[i]]],
-                                      select_evenly_spaced(snakes_body[i], K_SEGMENTS)])
-                      for i in nearest_ixs]
-    _snake_flat = np.concat(nearest_snakes).flatten() if nearest_snakes else np.array([], dtype=np.float32)
+    nearest_snakes = [np.concat([
+        snakes_body[i][[nearest_seg_ixs[i]]],
+        select_evenly_spaced(snakes_body[i], K_SEGMENTS)
+    ]) for i in nearest_ixs]
+    _snake_flat = np.concat(nearest_snakes).flatten() if snakes_body else []
     snake_flat = np.zeros(K_SNAKE * (K_SEGMENTS + 1) * 2, dtype=np.float32)
     snake_flat[:len(_snake_flat)] = _snake_flat
-    _metas = np.concatenate([snakes_meta[i] for i in nearest_ixs]) if len(nearest_ixs) else np.array([], dtype=np.float32)
-    nearest_metas = np.zeros(K_SNAKE * 4, dtype=np.float32)
+
+    _metas = np.concat([snakes_meta[i] for i in nearest_ixs]) if snakes_body else []
+    nearest_metas = np.zeros(K_SNAKE * META_SIZE, dtype=np.float32)
     nearest_metas[:len(_metas)] = _metas
 
     _own_segs = select_evenly_spaced(own_body, K_SEGMENTS).flatten()
     own_segs = np.zeros(K_SEGMENTS * 2, dtype=np.float32)
     own_segs[:len(_own_segs)] = _own_segs
 
-    food_flat[2::3] /= AVOID_DIST
-    snake_flat[1::2] /= AVOID_DIST
-    own_segs[1::2]   /= AVOID_DIST
+    food_flat[1:] /= AVOID_DIST
+    snake_flat    /= AVOID_DIST
+    own_segs      /= AVOID_DIST
 
-    return np.concatenate([own_meta, food_flat, snake_flat, nearest_metas, own_segs]).astype(np.float32)
+    return np.concat([own_meta, food_flat, snake_flat, nearest_metas, own_segs]).astype(np.float32)
+
+
+def get_flat(d):
+    if not d: return d
+    own_size, food, own_meta, own_body, snakes_meta, snakes_body = parse_record(d)
+    return make_flat_input(food, own_meta, own_body, snakes_meta, snakes_body)
 
 
 def avoid_focus_features(x):
@@ -369,7 +386,10 @@ class SupervisedTrainer:
 
 
 def bot_script(state_d):
-    food_dat = state_d[1]   # [[sz, angle_pi, dist], ...]
+    if not state_d: # dead
+        return [-1, 0]
+
+    food_dat = state_d[1]   # [[size, x, y], ...]
     own_props = state_d[2]
     snake_scale = own_props[3]
     snakes = state_d[3]
@@ -379,44 +399,36 @@ def bot_script(state_d):
     avoid_angle = None
     for snake in snakes:
         body = snake[4:]
-        for angle, dist in zip(body[::2], body[1::2]):
+        for x, y in zip(body[::2], body[1::2]):
+            dist = np.linalg.norm([x, y])
             if dist < min_dist:
                 min_dist = dist
-                avoid_angle = angle
+                avoid_angle = np.atan2(y, x)
 
     boost = 0
     if min_dist < AVOID_DIST and avoid_angle is not None:
-        target_angle = angle_sub(avoid_angle, 1)
-        if abs(angle_sub(heading, target_angle)) < .3:
+        target_angle = angle_sub(avoid_angle, np.pi)
+        if abs(angle_sub(heading, target_angle)) < 1: # within ~pi/3
             boost = 1
 
     else:
-        # Seek food with best size-per-distance value, restricted to the same
-        # top-K_FOOD-by-size candidates that get_flat encodes (so the target
-        # angle is always present in the feature vector).
+        # Seek food with best size-per-distance value
         candidates = sorted(food_dat, key=lambda f: f[0], reverse=True)[:K_FOOD]
         best_val = float('inf')
         for f in candidates:
-            sz, angle, dist = f[0], f[1], f[2]
-            val = dist / sz
+            size, x, y = f[0], f[1], f[2]
+            dist = np.linalg.norm([x, y])
+            val = dist / size
             if val < best_val and dist > 50 * snake_scale:
                 best_val = val
-                target_angle = angle
+                target_angle = np.atan2(y, x)
 
     is_avoiding = min_dist < AVOID_DIST and avoid_angle is not None
     return [target_angle, boost, is_avoiding]
 
 
-def get_flat(d):
-    own_size, food, own_meta, own_body, snakes_meta, snakes_body, _, _ = parse_record(d)
-    return make_flat_input(food, own_meta, own_body, snakes_meta, snakes_body)
-
-
-def angle_sub(from_ang, to):
-    d = (from_ang - to) % 2
-    if d > 1:
-        d -= 2
-    return d
+def angle_sub(a, b):
+    return (a - b + np.pi) % (2 * np.pi) - np.pi
 
 
 def select_evenly_spaced(arr, k):
