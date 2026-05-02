@@ -19,7 +19,7 @@ function post(path, data){
 
 window.bot = {
     active: true,
-    dead: false,
+    dead: true,
     toggle: ()=>{
         window.bot.active = !window.bot.active
     },
@@ -40,30 +40,34 @@ const _startShowGame = window.startShowGame
 window.startShowGame = function() {
     _startShowGame.apply(this, arguments)
     bot.dead = false
+    console.log("GAME BEGIN");
+    bgp2 = null // disable background for Canvas
+    if(bgee) bgee.visible = false // disable BG for WebGL mode
 };
 
 function onGameStart() {
-    console.log("Game started!");
     // your bot init here
 }
 
 bot.connect = ()=>{
     console.log('Connecting to inference server ' + bot.ws_server)
     bot.ws = new WebSocket(bot.ws_server);
-    bot.ws.onclose = () =>{
+    bot.ws.onerror = e => console.error('[bot] ws error', e)
+    bot.ws.onclose = e =>{
+        console.log('[bot] ws closed code=' + e.code + ' reason=' + e.reason + ' clean=' + e.wasClean, e)
         if(bot.behavior == 1 && bot.active)
             setTimeout(bot.connect, 1000);
     }
 
     bot.ws.onmessage = e => {
-        const [angle, boost] = JSON.parse(e.data)
+        const [angle, boost, timestamp] = JSON.parse(e.data)
         window.xm = Math.cos(angle) * 100
         window.ym = Math.sin(angle) * 100
         if(boost !== bot.last_boost) { setAcceleration(boost); bot.last_boost = boost }
         bot.counter += 1
         if(!(bot.counter % 10)) {
             const now = new Date().getTime()
-            console.log(angle, boost, now - bot.t0)
+            console.log(angle, boost, new Date().getTime() - timestamp)
         }
     }
 }
@@ -71,6 +75,7 @@ bot.connect()
 
 bot.post_mortem = ()=>{
     if(bot.dead || bot.behavior != 1) return
+    console.log('UH OH')
     bot.dead = true
     if(bot.ws.readyState === WebSocket.OPEN) bot.ws.send('[]')
     // wait for game server socket to close before restarting
@@ -78,16 +83,17 @@ bot.post_mortem = ()=>{
 }
 
 bot.get_record = me =>{
+    now = new Date().getTime()
     const relc = (x, y)=> [x - me.xx, y - me.yy]
 
     const get_props = s =>{
-        var data = [s.wang, s.ang, s.sp / 14, s.sc]
-        data = data.concat(relc(s.xx, s.yy))
+        const meta = [s.wang, s.ang, s.tl, s.sc, s.sp / 14, s.ssp, s.id]
+        const segs = [relc(s.xx, s.yy)]
 
         const skip = Math.max(1, Math.floor(s.pts.length / 30))
         for(let i = 0; i < s.pts.length; i += skip)
-            data = data.concat(relc(s.pts[i].xx, s.pts[i].yy))
-        return data
+            segs.push(relc(s.pts[i].xx, s.pts[i].yy))
+        return [meta, segs]
     }
 
     const food_dat = []
@@ -95,7 +101,7 @@ bot.get_record = me =>{
         if(!f) return
         const [x, y] = relc(f.xx, f.yy)
         const d = Math.sqrt(x * x + y * y)
-        if(d < 700) food_dat.push([f.sz / 14, x, y])
+        food_dat.push([f.sz / 13, x, y])
     })
 
     me_props = get_props(me)
@@ -103,10 +109,9 @@ bot.get_record = me =>{
     const edge_x = Math.cos(world_ang) * window.flux_grd + window.grd
     const edge_y = Math.sin(world_ang) * window.flux_grd + window.grd
     const edge_xd = me.xx - edge_x, edge_yd = me.yy - edge_y
-    me_props[4] = edge_xd
-    me_props[5] = edge_yd
+    me_props[1][0] = [edge_xd, edge_yd]
 
-    return [me.sct + me.fam, food_dat, me_props, slithers.filter(s => s != me).map(get_props)]
+    return [me_props, slithers.filter(s => s != me).map(get_props), food_dat, now]
 }
 
 bot.behaviors = [
@@ -169,7 +174,6 @@ me =>{
 },
 
 me =>{
-    bot.t0 = new Date().getTime()
     const game_state = bot.get_record(me)
     if(bot.ws.readyState === WebSocket.OPEN) bot.ws.send(JSON.stringify(game_state))
 },

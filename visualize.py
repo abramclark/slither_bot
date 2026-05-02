@@ -21,30 +21,35 @@ import matplotlib.animation as animation
 
 from model import (
     AVOID_DIST, bot_script, get_flat,
-    K_FOOD, K_SNAKE, K_SEGMENTS,
+    K_BIG_FOOD, K_SM_FOOD, K_FOOD, K_SNAKE, K_SEGMENTS,
     DIRX_INDEX, HEADINGX_INDEX,
-    FOOD_START_INDEX, FOOD_END_INDEX,
-    AVOIDX_INDEX, OWN_SEGMENTS_INDEX,
+    FOOD_START_INDEX, FOOD_SM_INDEX, FOOD_END_INDEX,
+    AVOIDX_INDEX,
 )
 
 
 def load_examples(path):
-    episode = []
+    episode    = []
+    line_idx   = 0
+    ep_start   = 0
     with open(path) as f:
-        for line in f:
-            line = line.strip()
+        for raw in f:
+            line = raw.strip()
             if not line:
                 continue
             if line == '[]':
                 if episode:
-                    yield episode
+                    yield episode, ep_start
                     episode = []
             else:
                 d = json.loads(line)
                 if isinstance(d, list) and len(d) == 4:
+                    if not episode:
+                        ep_start = line_idx
                     episode.append(d)
+            line_idx += 1
     if episode:
-        yield episode
+        yield episode, ep_start
 
 
 ENEMY_COLORS = ['#e74c3c', '#e67e22', '#9b59b6', '#1abc9c', '#3498db']
@@ -54,7 +59,7 @@ BG = '#1a1a2e'
 def _setup_ax(ax):
     ax.clear()
     ax.set_aspect('equal')
-    lim = 700
+    lim = 1000
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
     ax.set_facecolor(BG)
@@ -66,36 +71,34 @@ def _setup_ax(ax):
 def draw_frame(ax, frame):
     lim = _setup_ax(ax)
 
-    food_dat  = frame[1]
-    own_props = frame[2]
-    snakes    = frame[3]
+    me, others, food_dat, timestamp = frame
+    me_meta, me_segs = me
 
     target_dir, target_boost, is_avoiding = bot_script(frame)
 
     # Food
     for food in food_dat:
         sz, x, y = food[0], food[1], food[2]
-        ax.plot(x, y, 'o', color='#f7dc6f', markersize=max(2, sz * 0.4), alpha=0.7)
+        color = '#b4340f' if sz > 0.9 else '#f7dc6f'
+        ax.plot(x, y, 'o', color=color, markersize=max(2, sz * 10), alpha=0.7)
 
     # Enemies
-    for ei, snake in enumerate(snakes):
+    for ei, snake in enumerate(others):
         color = ENEMY_COLORS[ei % len(ENEMY_COLORS)]
-        hx, hy = snake[4], snake[5]
-        xs, ys = [], []
-        for j in range(6, len(snake) - 1, 2):
-            xs.append(snake[j])
-            ys.append(snake[j + 1])
-        if xs:
-            ax.plot(xs, ys, '-', color=color, linewidth=2, alpha=0.5)
-        ax.plot(hx, hy, 'o', color=color, markersize=8, zorder=5)
+        s_meta, s_segs = snake
+        if s_segs:
+            hx, hy = s_segs[0][0], s_segs[0][1]
+            xs = [seg[0] for seg in s_segs[1:]]
+            ys = [seg[1] for seg in s_segs[1:]]
+            if xs:
+                ax.plot(xs, ys, '-', color=color, linewidth=2, alpha=0.5)
+            ax.plot(hx, hy, 'o', color=color, markersize=8, zorder=5)
 
-    # Own snake — head is at (0, 0), body drawn separately
-    heading = own_props[1]
-    xs, ys = [], []
-    for j in range(6, len(own_props) - 1, 2):
-        xs.append(own_props[j])
-        ys.append(own_props[j + 1])
-    if xs:
+    # Own snake — head is at (0, 0), body drawn from segments
+    heading = me_meta[1]
+    if me_segs:
+        xs = [seg[0] for seg in me_segs]
+        ys = [seg[1] for seg in me_segs]
         ax.plot(xs, ys, '-', color='#2ecc71', linewidth=2.5, alpha=0.8)
     ax.plot(0, 0, 'o', color='#2ecc71', markersize=10, zorder=6)
 
@@ -115,32 +118,33 @@ def draw_frame(ax, frame):
 def draw_frame_flat(ax, x):
     lim = _setup_ax(ax)
 
-    # Food — coordinates normalized by AVOID_DIST, skip zero-padded entries
-    food_xy = x[FOOD_START_INDEX + 1:FOOD_END_INDEX].reshape(K_FOOD, 2) * AVOID_DIST
-    for fx, fy in food_xy:
+    # Big food (first K_BIG_FOOD slots), then small food
+    big_xy = x[FOOD_START_INDEX:FOOD_SM_INDEX].reshape(K_BIG_FOOD, 2) * AVOID_DIST
+    sm_xy  = x[FOOD_SM_INDEX:FOOD_END_INDEX].reshape(K_SM_FOOD, 2) * AVOID_DIST
+    for fx, fy in big_xy:
+        if fx != 0 or fy != 0:
+            ax.plot(fx, fy, 'o', color='#b4340f', markersize=8, alpha=0.7)
+    for fx, fy in sm_xy:
         if fx != 0 or fy != 0:
             ax.plot(fx, fy, 'o', color='#f7dc6f', markersize=4, alpha=0.7)
 
-    # Enemy snakes — (K_SEGMENTS+1) segments each, first is the nearest
-    snake_segs = (x[AVOIDX_INDEX:AVOIDX_INDEX + K_SNAKE * (K_SEGMENTS + 1) * 2]
-                  .reshape(K_SNAKE, K_SEGMENTS + 1, 2) * AVOID_DIST)
+    # Enemy snakes — 3 segments each: closest, head, last
+    snake_segs = (x[AVOIDX_INDEX:AVOIDX_INDEX + K_SNAKE * K_SEGMENTS * 2]
+                  .reshape(K_SNAKE, K_SEGMENTS, 2) * AVOID_DIST)
     for ei in range(K_SNAKE):
         segs = snake_segs[ei]
         if not np.any(segs):
             continue
         color = ENEMY_COLORS[ei % len(ENEMY_COLORS)]
-        hx, hy = segs[0]
-        body = segs[1:]
-        body = body[np.any(body != 0, axis=1)]
-        if len(body):
-            ax.plot(body[:, 0], body[:, 1], '-', color=color, linewidth=2, alpha=0.5)
-        ax.plot(hx, hy, 'o', color=color, markersize=8, zorder=5)
+        closest, head, last = segs[0], segs[1], segs[2]
+        ax.plot([closest[0], head[0], last[0]], [closest[1], head[1], last[1]],
+                '-', color=color, linewidth=2, alpha=0.5)
+        ax.plot(head[0], head[1], 'o', color=color, markersize=8, zorder=5)
+        ax.plot(closest[0], closest[1], 'x', color=color, markersize=6, zorder=5)
 
-    # Own snake body
-    own_segs = x[OWN_SEGMENTS_INDEX:].reshape(K_SEGMENTS, 2) * AVOID_DIST
-    own_segs = own_segs[np.any(own_segs != 0, axis=1)]
-    if len(own_segs):
-        ax.plot(own_segs[:, 0], own_segs[:, 1], '-', color='#2ecc71', linewidth=2.5, alpha=0.8)
+    # Own snake body — draw head-to-tail line; last 2 elements are tail x,y
+    tail = x[-2:] * AVOID_DIST
+    ax.plot([0, tail[0]], [0, tail[1]], '-', color='#2ecc71', linewidth=2.5, alpha=0.8)
     ax.plot(0, 0, 'o', color='#2ecc71', markersize=10, zorder=6)
 
     r = 80
@@ -188,21 +192,22 @@ def main():
     state = {'ei': 0, 'fi': 0}
 
     def ep_label():
-        total = str(len(episodes)) + ('' if done[0] else '+')
-        return f"Episode {state['ei'] + 1}/{total}"
+        total    = str(len(episodes)) + ('' if done[0] else '+')
+        _, start = episodes[state['ei']]
+        return f"Episode {state['ei'] + 1}/{total}  line {start}"
 
     fig, ax = plt.subplots(figsize=(8, 8))
     fig.patch.set_facecolor(BG)
 
     def update(_):
         ei, fi = state['ei'], state['fi']
-        frames = episodes[ei]
+        frames, _ = episodes[ei]
         frame = frames[fi]
         if args.flat:
             draw_frame_flat(ax, get_flat(frame))
         else:
             draw_frame(ax, frame)
-        ax.set_title(f"{ep_label()}  frame {fi + 1}/{len(frames)}",
+        ax.set_title(f"{ep_label()}  frame {fi + 1}/{len(frames)}  line {episodes[ei][1] + fi}",
                      color='white', fontsize=11)
         state['fi'] = (fi + 1) % len(frames)
 
@@ -220,6 +225,12 @@ def main():
             state['ei'] = max(0, state['ei'] - 1)
             state['fi'] = 0
             print(ep_label())
+        elif event.key == 'right':
+            frames, _ = episodes[state['ei']]
+            state['fi'] = (state['fi'] + 50) % len(frames)
+        elif event.key == 'left':
+            frames, _ = episodes[state['ei']]
+            state['fi'] = (state['fi'] - 50) % len(frames)
         elif event.key == 'q':
             plt.close('all')
             sys.exit(0)

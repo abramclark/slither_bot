@@ -17,11 +17,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from model import get_flat
-from value_model import ValueNet, FINE_INDICES, BODY_FREEZE_INDICES, FOOD_FREEZE_INDICES
+from model import get_flat, IN_DIM, OWN_SEGMENTS_INDEX, FOOD_START_INDEX, FOOD_END_INDEX
+from value_model import ValueNet, FINE_INDICES
 from value2_model import Value2Net
 import value_model  as _vm1
 import value2_model as _vm2
+
+BODY_FREEZE_INDICES = list(range(OWN_SEGMENTS_INDEX + 2, IN_DIM))
+FOOD_FREEZE_INDICES = list(range(FOOD_START_INDEX, FOOD_END_INDEX))
 
 MODEL_REGISTRY = {
     'value':  (_vm1, ValueNet),

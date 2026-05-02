@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 import asyncio
 import json
+import logging
 import os
 import queue
 import random
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-import numpy as np
-import torch
 import websockets
+import websockets.asyncio.server
 
-from model import get_flat, bot_script
-from time import time
-from value_model import ValueNet
-from value2_model import Value2Net
+from model import bot_script, ImprovisingScript
+from value_model import ValueNet, ImprovisingValueNet
+
+#logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
 
 WS_PORT   = 9002
 HTTP_PORT = 9001
@@ -42,14 +42,14 @@ def _debug_worker():
         _debug_done.set()
 
 
-class _ControlHandler(BaseHTTPRequestHandler):
+class HTTPHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         global _mode, _no_boost
         length = int(self.headers.get('Content-Length', 0))
         body = json.loads(self.rfile.read(length)) if length else {}
         if self.path == '/':
             if 'mode' in body:
-                if body['mode'] in ('value', 'value2', 'script', 'record'):
+                if body['mode'] in ('script', 'iscript', 'value', 'ivalue', 'record'):
                     _mode = body['mode']
                     print(f"[server] mode → {_mode}")
                 else:
@@ -86,7 +86,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
         pass  # suppress per-request logs
 
 
-class _ReuseHTTPServer(HTTPServer):
+class ReuseHTTPServer(HTTPServer):
     allow_reuse_address = True
 
 
@@ -104,66 +104,40 @@ def _log(line):
     _log_file.flush()
 
 
-class ValueRuntime:
-    def __init__(self, model_cls):
-        save_path = model_cls.save_path
-        self.tag = model_cls.__name__
-        self.model = model_cls()
-        try:
-            ckpt = torch.load(save_path, weights_only=True)
-            self.model.load_state_dict(ckpt["model"])
-            ep = ckpt.get("ep", 0)
-            print(f"{self.tag}: resumed from {save_path} (ep={ep})")
-        except FileNotFoundError:
-            print(f"{self.tag}: no checkpoint at {save_path}, starting fresh")
-        self.model.eval()
+_iscript = ImprovisingScript()
+_value = ValueNet()
+_ivalue = ImprovisingValueNet(lambda x: _value.act(x))
 
-    def handle_message(self, state_d):
-        if not state_d:
-            return [0, 0]
-        x = get_flat(state_d).astype(np.float32)
-        game_dir, boost, val = self.model.act(x)
-        if state_d[0] < 3: boost = 0
-        print(f"[{self.tag}] dir={game_dir:.3f}  boost={boost}  val={val:.3f}")
-        return [game_dir, boost]
-
-
-_value_runtime = _value2_runtime = None
-def value_act(state):  return _value_runtime.handle_message(state)
-def value2_act(state): return _value2_runtime.handle_message(state)
-
-
-_mode = 'value'
+_mode = 'iscript'
 modes = dict(
-    value=value_act,
-    value2=value2_act,
-    script=lambda s: bot_script(s)[:2],
-    record=lambda f: [-1, 0],
+    iscript=lambda x: _iscript.act(x),
+    ivalue=lambda x: _ivalue.act(x),
+    value=lambda x: (_value.act(x), None),
+    script=lambda x: (bot_script(x), None),
+    record=lambda f: ([-1, 0], None),
 )
-
 
 async def ws_handler(websocket):
     global _no_boost
     print(f"[server] new connection — mode={_mode}  no_boost={_no_boost}")
-
     episode_buf = []
 
     async for message in websocket:
         try:
-            state_d = json.loads(message)
-            if not state_d:
+            state = json.loads(message)
+            if not state:
                 for frame in episode_buf:
                     _log(frame)
-                _log(json.dumps(state_d))
+                _log(json.dumps(state))
                 episode_buf.clear()
                 _roll_no_boost()
                 print(f"[server] DEAD — no_boost={_no_boost} active={_no_boost_active}\n")
             else:
-                episode_buf.append(json.dumps(state_d))
-            response = modes[_mode](state_d)
-            if _no_boost_active and response:
-                response[1] = 0
-            await websocket.send(json.dumps(response))
+                action, improv = modes[_mode](state)
+                if _no_boost_active and action:
+                    action[1] = 0
+                episode_buf.append(json.dumps([state, action, improv]))
+                await websocket.send(json.dumps([action[0], action[1], state[-1]])) # pass timestamp through
 
         except Exception as e:
             import traceback, sys
@@ -174,22 +148,41 @@ async def ws_handler(websocket):
             await websocket.send(json.dumps({"error": str(e)}))
 
 
+class _PNAServerConnection(websockets.asyncio.server.ServerConnection):
+    """Intercept Chrome's Private Network Access OPTIONS preflight before websockets parses it."""
+    def data_received(self, data: bytes) -> None:
+        if data.lstrip().startswith(b"OPTIONS"):
+            self.transport.write(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Access-Control-Allow-Origin: *\r\n"
+                b"Access-Control-Allow-Private-Network: true\r\n"
+                b"Content-Length: 0\r\n"
+                b"\r\n"
+            )
+            self.transport.close()
+        else:
+            super().data_received(data)
+
+
+async def _process_response(connection, request, response):
+    response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
+
+
 async def run_ws():
-    async with websockets.serve(ws_handler, "", WS_PORT):
+    async with websockets.serve(ws_handler, "", WS_PORT,
+                                create_connection=_PNAServerConnection,
+                                process_response=_process_response):
         print(f"WebSocket on ws://localhost:{WS_PORT}")
         print(f"HTTP control on http://localhost:{HTTP_PORT}/mode")
         await asyncio.get_event_loop().create_future()
 
 
 def main():
-    global _value_runtime, _value2_runtime
-    _value_runtime  = ValueRuntime(ValueNet)
-    _value2_runtime = ValueRuntime(Value2Net)
-
     threading.Thread(target=_debug_worker, daemon=True).start()
 
     threading.Thread(
-        target=lambda: _ReuseHTTPServer(('', HTTP_PORT), _ControlHandler).serve_forever(),
+        target=lambda: ReuseHTTPServer(('', HTTP_PORT), HTTPHandler).serve_forever(),
         daemon=True,
     ).start()
 
@@ -205,7 +198,7 @@ if __name__ == "__main__":
         from watchfiles import watch
         cmd = [sys.executable, __file__, "--no-reload"]
         proc = subprocess.Popen(cmd)
-        watch_paths = [p for p in [__file__, "model.py", "value_model.py", "value2_model.py", "value.pt", "value2.pt"] if os.path.exists(p)]
+        watch_paths = [p for p in [__file__, "server.py", "model.pt", "value.pt", "value2.pt"] if os.path.exists(p)]
         try:
             for _ in watch(*watch_paths):
                 print("File changed — restarting...")

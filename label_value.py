@@ -18,34 +18,33 @@ import numpy as np
 
 
 def label(gamma, death_value, no_growth=False, no_death=False, death_offset=3):
-    lines = []
-    for raw in sys.stdin:
-        raw = raw.strip()
-        if raw:
-            lines.append(raw)
-
-    labels = np.full(len(lines), np.nan, dtype=np.float32)
-
     episodes: list[list[tuple[int, float]]] = []
     episode:  list[tuple[int, float]]       = []
     n_skipped = 0
+    line_idx  = 0
 
-    for i, raw in enumerate(lines):
+    for raw in sys.stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
         try:
             d = json.loads(raw)
         except json.JSONDecodeError:
             n_skipped += 1
+            line_idx += 1
             continue
         if isinstance(d, list) and len(d) == 0:
             if episode:
                 episodes.append(episode)
                 episode = []
         elif isinstance(d, list) and len(d) == 4:
-            episode.append((i, float(d[0])))
+            episode.append((line_idx, float(d[0][0][2])))  # me[0][2] = size
         else:
             n_skipped += 1
+        line_idx += 1
 
     trailing = len(episode)
+    labels = np.full(line_idx, np.nan, dtype=np.float32)
 
     deltas = [episode[t + 1][1] - episode[t][1]
               for episode in episodes
@@ -53,7 +52,7 @@ def label(gamma, death_value, no_growth=False, no_death=False, death_offset=3):
     avg_value = float(np.mean(deltas)) if deltas else 0.0
 
     # Pass 1: life-only returns (r=0 at terminal) for normalization stats
-    labels_alive = np.full(len(lines), np.nan, dtype=np.float32)
+    labels_alive = np.full(line_idx, np.nan, dtype=np.float32)
     for episode in episodes:
         T = len(episode)
         G = 0.0
@@ -99,7 +98,7 @@ def main():
     p.add_argument("--death-value",  type=float, default=-20.0)
     p.add_argument("--no-growth",    action="store_true")
     p.add_argument("--no-death",     action="store_true")
-    p.add_argument("--death-offset", type=int, default=3)
+    p.add_argument("--death-offset", type=int, default=2)
     args = p.parse_args()
     label(args.gamma, args.death_value, args.no_growth, args.no_death, args.death_offset)
 
