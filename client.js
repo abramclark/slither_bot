@@ -34,6 +34,7 @@ window.bot = {
 
     ws_server: 'ws://localhost:9002',
     ws: null,
+    session: null,
 }
 
 const _startShowGame = window.startShowGame
@@ -50,8 +51,9 @@ function onGameStart() {
 }
 
 bot.connect = ()=>{
-    console.log('Connecting to inference server ' + bot.ws_server)
-    bot.ws = new WebSocket(bot.ws_server);
+    const url = bot.session ? bot.ws_server + '/' + bot.session : bot.ws_server
+    console.log('Connecting to inference server ' + url)
+    bot.ws = new WebSocket(url);
     bot.ws.onerror = e => console.error('[bot] ws error', e)
     bot.ws.onclose = e =>{
         console.log('[bot] ws closed code=' + e.code + ' reason=' + e.reason + ' clean=' + e.wasClean, e)

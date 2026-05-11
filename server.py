@@ -9,26 +9,31 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import websockets
-import websockets.asyncio.server
+from websockets.http11 import Response
+from websockets.datastructures import Headers
 
-from model import bot_script, ImprovisingScript
-from value_model import ValueNet, ImprovisingValueNet
+from model import bot_script, ImprovisingScript, PolicyNet
+from sac_model import SACNet
 
 #logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
 
 WS_PORT   = 9002
 HTTP_PORT = 9001
-LOG_PATH  = "experience.jsonl"
 
 _debug_queue = queue.Queue()
 _debug_done  = threading.Event()
 _no_boost        = False  # True / False / 'random'
 _no_boost_active = random.random() < 0.5
+_session_count   = 0
 
 
 def _roll_no_boost():
     global _no_boost_active
-    _no_boost_active = random.random() < 0.5 if _no_boost == 'random' else bool(_no_boost)
+    if _no_boost == 'random':
+        _no_boost_active = random.random() < 0.5
+    else:
+        _no_boost_active = bool(_no_boost)
+    print(f"[server] current no_boost → {_no_boost_active}")
 
 
 def _debug_worker():
@@ -49,7 +54,7 @@ class HTTPHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length)) if length else {}
         if self.path == '/':
             if 'mode' in body:
-                if body['mode'] in ('script', 'iscript', 'value', 'ivalue', 'record'):
+                if body['mode'] in ('script', 'iscript', 'policy', 'sac', 'record'):
                     _mode = body['mode']
                     print(f"[server] mode → {_mode}")
                 else:
@@ -59,20 +64,22 @@ class HTTPHandler(BaseHTTPRequestHandler):
             if 'no_boost' in body:
                 val = body['no_boost']
                 _no_boost = 'random' if val == 'random' else bool(val)
-                _roll_no_boost()
                 print(f"[server] no_boost → {_no_boost}")
+            if 'det' in body:
+                _sac.deterministic = bool(body['det'])
+                print(f"[server] sac.deterministic → {_sac.deterministic}")
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
             self.end_headers()
-            self.wfile.write(json.dumps({'mode': _mode, 'no_boost': _no_boost}).encode())
+            self.wfile.write(json.dumps(_control_state()).encode())
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_GET(self):
         if self.path == '/':
-            body = json.dumps({'mode': _mode, 'no_boost': _no_boost, 'no_boost_current': _no_boost_active}).encode()
+            body = json.dumps(_control_state()).encode()
             self.send_response(200)
             self.send_header('Content-Type', 'application/json')
             self.send_header('Access-Control-Allow-Origin', '*')
@@ -90,79 +97,90 @@ class ReuseHTTPServer(HTTPServer):
     allow_reuse_address = True
 
 
-_log_file = open(LOG_PATH, "a")
-def _log(line):
-    """Append a line to the log, reopening the file if it has been moved or deleted."""
-    global _log_file
+
+
+def _reopen_if_needed(f, path):
     try:
-        if not os.path.exists(LOG_PATH) or os.fstat(_log_file.fileno()).st_ino != os.stat(LOG_PATH).st_ino:
-            _log_file.close()
-            _log_file = open(LOG_PATH, "a")
+        if not os.path.exists(path) or os.fstat(f.fileno()).st_ino != os.stat(path).st_ino:
+            f.close()
+            return open(path, "a")
     except OSError:
-        _log_file = open(LOG_PATH, "a")
-    _log_file.write(line + "\n")
-    _log_file.flush()
+        return open(path, "a")
+    return f
+
+
+def _control_state():
+    return {
+        'mode': _mode,
+        'no_boost': _no_boost,
+        'det': int(_sac.deterministic),
+    }
 
 
 _iscript = ImprovisingScript()
-_value = ValueNet()
-_ivalue = ImprovisingValueNet(lambda x: _value.act(x))
+_policy = PolicyNet()
+_sac = SACNet()
 
-_mode = 'iscript'
+_mode = 'sac'
 modes = dict(
-    iscript=lambda x: _iscript.act(x),
-    ivalue=lambda x: _ivalue.act(x),
-    value=lambda x: (_value.act(x), None),
     script=lambda x: (bot_script(x), None),
+    iscript=lambda x: _iscript.act(x),
+    policy=lambda x: (_policy.act(x), None),
+    sac=lambda x: (_sac.act(x), None),
     record=lambda f: ([-1, 0], None),
 )
 
 async def ws_handler(websocket):
-    global _no_boost
-    print(f"[server] new connection — mode={_mode}  no_boost={_no_boost}")
+    global _session_count
+    session = websocket.request.path.lstrip('/')
+    if not session:
+        _session_count += 1
+        session = str(_session_count)
+    os.makedirs("experience", exist_ok=True)
+    log_path = f"experience/{session}.jsonl"
+    log_file = open(log_path, "a")
     episode_buf = []
+    print(f"[server] new connection — session={session} mode={_mode}  no_boost={_no_boost}")
 
-    async for message in websocket:
-        try:
-            state = json.loads(message)
-            if not state:
-                for frame in episode_buf:
-                    _log(frame)
-                _log(json.dumps(state))
-                episode_buf.clear()
-                _roll_no_boost()
-                print(f"[server] DEAD — no_boost={_no_boost} active={_no_boost_active}\n")
-            else:
-                action, improv = modes[_mode](state)
-                if _no_boost_active and action:
-                    action[1] = 0
-                episode_buf.append(json.dumps([state, action, improv]))
-                await websocket.send(json.dumps([action[0], action[1], state[-1]])) # pass timestamp through
+    try:
+        async for message in websocket:
+            try:
+                state = json.loads(message)
+                if not state:
+                    log_file = _reopen_if_needed(log_file, log_path)
+                    for frame in episode_buf:
+                        log_file.write(frame + "\n")
+                    log_file.write(json.dumps(state) + "\n")
+                    log_file.flush()
+                    episode_buf.clear()
+                    print(f"[server] DEAD — session={session} no_boost={_no_boost}\n")
+                    _roll_no_boost()
+                else:
+                    action, improv = modes[_mode](state)
+                    if _no_boost_active and action:
+                        action[1] = 0
+                    episode_buf.append(json.dumps([state, action, improv]))
+                    send = improv if improv else action
+                    await websocket.send(json.dumps([send[0], send[1], state[-1]])) # pass timestamp through
 
-        except Exception as e:
-            import traceback, sys
-            traceback.print_exc()
-            _debug_done.clear()
-            _debug_queue.put(sys.exc_info())
-            await asyncio.get_event_loop().run_in_executor(None, _debug_done.wait)
-            await websocket.send(json.dumps({"error": str(e)}))
+            except Exception as e:
+                import traceback, sys
+                traceback.print_exc()
+                _debug_done.clear()
+                _debug_queue.put(sys.exc_info())
+                await asyncio.get_event_loop().run_in_executor(None, _debug_done.wait)
+                await websocket.send(json.dumps({"error": str(e)}))
+    finally:
+        log_file.close()
 
 
-class _PNAServerConnection(websockets.asyncio.server.ServerConnection):
-    """Intercept Chrome's Private Network Access OPTIONS preflight before websockets parses it."""
-    def data_received(self, data: bytes) -> None:
-        if data.lstrip().startswith(b"OPTIONS"):
-            self.transport.write(
-                b"HTTP/1.1 200 OK\r\n"
-                b"Access-Control-Allow-Origin: *\r\n"
-                b"Access-Control-Allow-Private-Network: true\r\n"
-                b"Content-Length: 0\r\n"
-                b"\r\n"
-            )
-            self.transport.close()
-        else:
-            super().data_received(data)
-
+async def _process_request(connection, request):
+    if request.headers.get('Upgrade', '').lower() != 'websocket':
+        return Response(200, 'OK', Headers([
+            ('Access-Control-Allow-Origin', '*'),
+            ('Access-Control-Allow-Private-Network', 'true'),
+            ('Content-Length', '0'),
+        ]))
 
 async def _process_response(connection, request, response):
     response.headers["Access-Control-Allow-Private-Network"] = "true"
@@ -171,7 +189,7 @@ async def _process_response(connection, request, response):
 
 async def run_ws():
     async with websockets.serve(ws_handler, "", WS_PORT,
-                                create_connection=_PNAServerConnection,
+                                process_request=_process_request,
                                 process_response=_process_response):
         print(f"WebSocket on ws://localhost:{WS_PORT}")
         print(f"HTTP control on http://localhost:{HTTP_PORT}/mode")
@@ -179,6 +197,8 @@ async def run_ws():
 
 
 def main():
+    _policy.load()
+    _sac.load()
     threading.Thread(target=_debug_worker, daemon=True).start()
 
     threading.Thread(
@@ -198,9 +218,11 @@ if __name__ == "__main__":
         from watchfiles import watch
         cmd = [sys.executable, __file__, "--no-reload"]
         proc = subprocess.Popen(cmd)
-        watch_paths = [p for p in [__file__, "server.py", "model.pt", "value.pt", "value2.pt"] if os.path.exists(p)]
+        watch_names = {"server.py", "policy.pt", "sac.pt"}
         try:
-            for _ in watch(*watch_paths):
+            for changes in watch("."):
+                if not any(os.path.basename(path) in watch_names for _, path in changes):
+                    continue
                 print("File changed — restarting...")
                 proc.terminate()
                 try:

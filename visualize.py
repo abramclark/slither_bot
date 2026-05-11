@@ -43,7 +43,7 @@ def load_examples(path):
                     episode = []
             else:
                 d = json.loads(line)
-                if isinstance(d, list) and len(d) == 4:
+                if isinstance(d, list) and len(d) == 3:
                     if not episode:
                         ep_start = line_idx
                     episode.append(d)
@@ -71,10 +71,11 @@ def _setup_ax(ax):
 def draw_frame(ax, frame):
     lim = _setup_ax(ax)
 
-    me, others, food_dat, timestamp = frame
+    state, action, improv = frame
+    me, others, food_dat, timestamp = state
     me_meta, me_segs = me
 
-    target_dir, target_boost, is_avoiding = bot_script(frame)
+    target_dir, target_boost, is_avoiding = bot_script(state)
 
     # Food
     for food in food_dat:
@@ -96,11 +97,11 @@ def draw_frame(ax, frame):
 
     # Own snake — head is at (0, 0), body drawn from segments
     heading = me_meta[1]
-    if me_segs:
-        xs = [seg[0] for seg in me_segs]
-        ys = [seg[1] for seg in me_segs]
-        ax.plot(xs, ys, '-', color='#2ecc71', linewidth=2.5, alpha=0.8)
     ax.plot(0, 0, 'o', color='#2ecc71', markersize=10, zorder=6)
+    if len(me_segs) > 1:
+        xs = [0] + [seg[0] for seg in reversed(me_segs[1:])]
+        ys = [0] + [seg[1] for seg in reversed(me_segs[1:])]
+        ax.plot(xs, ys, '-', color='#2ecc71', linewidth=2.5, alpha=0.8)
 
     r = 80
     ax.annotate('', xy=(math.cos(heading) * r, math.sin(heading) * r),
@@ -168,7 +169,10 @@ def main():
     p.add_argument("path", help="experience JSONL file")
     p.add_argument("--fps", type=int, default=5)
     p.add_argument("--flat", action="store_true", help="draw from get_flat() features")
+    p.add_argument("--labels", help="labels .npy file to overlay on frames")
     args = p.parse_args()
+
+    labels = np.load(args.labels) if args.labels else None
 
     gen      = load_examples(args.path)
     episodes = []
@@ -201,13 +205,19 @@ def main():
 
     def update(_):
         ei, fi = state['ei'], state['fi']
-        frames, _ = episodes[ei]
+        frames, ep_start = episodes[ei]
         frame = frames[fi]
         if args.flat:
-            draw_frame_flat(ax, get_flat(frame))
+            draw_frame_flat(ax, get_flat(frame[0]))
         else:
             draw_frame(ax, frame)
-        ax.set_title(f"{ep_label()}  frame {fi + 1}/{len(frames)}  line {episodes[ei][1] + fi}",
+        line_idx = ep_start + fi
+        if labels is not None and line_idx < len(labels):
+            lv = labels[line_idx]
+            color = '#2ecc71' if lv > 0 else '#e74c3c' if lv < 0 else 'white'
+            ax.text(980, 940, f"{lv:+.3f}", color=color, fontsize=13,
+                    fontweight='bold', ha='right', va='top')
+        ax.set_title(f"{ep_label()}  frame {fi + 1}/{len(frames)}  line {line_idx}",
                      color='white', fontsize=11)
         state['fi'] = (fi + 1) % len(frames)
 

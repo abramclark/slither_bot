@@ -2,11 +2,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from model import Model, ImprovisingAgent
+from model import PolicyNet, ImprovisingAgent, get_flat
 from model import (AVOIDX_INDEX, DIRX_INDEX, BOOST_INDEX, FOOD_START_INDEX, HEADINGX_INDEX, IN_DIM,
                    FOOD_END_INDEX, OWN_SEGMENTS_INDEX, ACTION_INDICES, CORE_INDICES)
 
-SAMPLE_COUNT = 16
+SAMPLE_COUNT = 8
 ACTION_SCALAR   = 10
 MID_LAYERS = [6, 9]
 
@@ -16,7 +16,7 @@ FINE_INDICES    = [i for i in range(IN_DIM) if i not in CORE_INDICES]
 def to_core(x): return x[..., CORE_INDICES]
 
 
-class ValueNet(Model):
+class ValueNet(PolicyNet):
     """Predicts V(t) = net_size_change - AVERAGE_VALUE * horizon - death_indicator."""
     save_path = "value.pt"
 
@@ -57,7 +57,7 @@ class ValueNet(Model):
         bb = torch.tensor([.413, 1.]).repeat(SAMPLE_COUNT)
 
         x_base = torch.tensor(x_fixed)
-        batch  = x_base.unsqueeze(0).expand(32, -1).clone()
+        batch  = x_base.unsqueeze(0).expand(SAMPLE_COUNT * 2, -1).clone()
         batch[:, DIRX_INDEX]         = hh.cos()
         batch[:, DIRX_INDEX + 1]     = hh.sin()
         #batch[:, HEADINGX_INDEX]     = hh.cos()
@@ -67,8 +67,9 @@ class ValueNet(Model):
         with torch.no_grad():
             return self(batch), hh, bb
 
-    def act(self, x_fixed: np.ndarray):
-        """Returns: (heading: float in [-1,1], boost: int 0/1, predicted_value: float)"""
+    def act(self, state):
+        """Returns: (heading: float, boost: int 0/1, predicted_value: float)"""
+        x_fixed = get_flat(state).astype(np.float32)
         vals, hh, bb = self.sample(x_fixed)
 
         # Shape: (SAMPLE_COUNT headings, 2 boosts); headings are circular
@@ -79,7 +80,13 @@ class ValueNet(Model):
         best_hi  = smoothed.argmax().item()
         best_bi  = vals_2d[best_hi].argmax().item()
 
-        return hh[best_hi * 2].item(), best_bi, vals_2d[best_hi, best_bi].item()
+        scores_str = ' '.join(
+            f"{'>' if i == best_hi else ' '}{hh[i*2].item():.2f}:{heading_scores[i].item():+.2f}"
+            for i in range(SAMPLE_COUNT)
+        )
+        print(f"[value] {scores_str}")
+
+        return [hh[best_hi * 2].item(), best_bi, vals_2d[best_hi, best_bi].item()]
 
 
 class ImprovisingValueNet(ImprovisingAgent):

@@ -5,3 +5,6 @@ develop pytorch code to train an agent to play slither.io by responding to reque
 
 YOU ARE ASSISTING IN BUILDING A PROTOTYPE. Do not add production features. DO NOT ADD
 EXCEPTION HANDLING unless strictly necessary.
+
+DO NOT COLUMN ALIGN CODE. This creates inflated diffs, making it more difficult to see
+functional changes.

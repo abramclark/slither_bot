@@ -1,13 +1,13 @@
 import math
-import collections
+import random
+import sys
 import threading
 
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-K_ANGLE_BINS = 8  # discrete direction output bins
+K_ANGLE_BINS = 16  # discrete direction output bins
 K_BIG_FOOD = 10 # nearest big foods
 K_SM_FOOD = 5   # nearest small foods
 K_FOOD = K_BIG_FOOD + K_SM_FOOD
@@ -46,7 +46,7 @@ def parse_record(d):
     own_segs = np.array(me[1], dtype=np.float32)
     snakes_meta = [flat_meta(s[0]) for s in others]
     snakes_segs = [np.array(s[1], dtype=np.float32) for s in others]
-    return own_size, flat_meta(self_data), own_segs, snakes_meta, snakes_segs, food
+    return own_size, flat_meta(me[0]), own_segs, snakes_meta, snakes_segs, food
 
 
 def flat_meta(d):
@@ -72,10 +72,11 @@ def make_flat_input(food, own_meta, own_segs, snakes_meta, snakes_segs):
     nearest_seg_ixs = [dists.argmin() for dists in snakes_dists]
     smallest_dists = np.array([dists[i] for i, dists in zip(nearest_seg_ixs, snakes_dists)])
     nearest_ixs = smallest_dists.argsort()[:K_SNAKE]
+    # nearest, head, tail segments for K_SNAKE closest snakes
     nearest_snakes = [np.concat([
         snakes_segs[i][nearest_seg_ixs[i]],
         snakes_segs[i][0],
-        snakes_segs[i][-1],
+        snakes_segs[i][1],
         #select_evenly_spaced(snakes_segs[i], K_SEGMENTS)
     ]) for i in nearest_ixs]
     _snake_flat = np.concat(nearest_snakes).flatten() if snakes_segs else []
@@ -89,7 +90,7 @@ def make_flat_input(food, own_meta, own_segs, snakes_meta, snakes_segs):
     #_own_segs = select_evenly_spaced(own_segs, K_SEGMENTS).flatten()
     #own_segs = np.zeros(K_SEGMENTS * 2, dtype=np.float32)
     #own_segs[:len(_own_segs)] = _own_segs
-    own_segs = np.concat([own_segs[0], own_segs[-1]])
+    own_segs = np.concat([own_segs[0], own_segs[1]])
 
     food_flat  /= AVOID_DIST
     snake_flat /= AVOID_DIST
@@ -142,17 +143,19 @@ def bot_script(state):
 
     else:
         # Seek closest food, preferring large one
-        best_dist = None
-        best_sm_dist = float('inf')
+        best_dist = 1200
+        best_sm_dist = 1200
         for f in food:
             size, x, y = f[0], f[1], f[2]
             dist = (x*x + y*y)**0.5
-            if dist < (best_dist if best_dist else best_sm_dist) and dist > 50 * snake_scale:
-                if size >= .9:
-                    best_dist = dist
-                else:
-                    best_sm_dist = dist
-                target_angle = math.atan2(y, x)
+            if dist < 50 * snake_scale: continue # don't circle too close food forever
+            if size >= .9 and dist < best_dist:
+                best_dist = dist
+                if dist > AVOID_DIST: boost = 1
+            elif best_dist == 1200 and dist < best_sm_dist:
+                best_sm_dist = dist
+            else: continue
+            target_angle = math.atan2(y, x)
 
     is_avoiding = min_dist < AVOID_DIST and avoid_angle is not None
     return [target_angle, boost, is_avoiding]
@@ -163,7 +166,7 @@ def angle_sub(a, b):
 
 
 class ImprovisingAgent():
-    def __init__(self, actor, improv_length=5, improv_prob=1e-3):
+    def __init__(self, actor, improv_length=10, improv_prob=0.007):
         self.actor = actor
         self.improv_length = improv_length
         self.improv_prob = improv_prob
@@ -174,6 +177,7 @@ class ImprovisingAgent():
         action = self.actor(x)
         if self.should_improvise(x, action):
             self.improv_i = self.improv_length
+            self.begin_improv()
         if self.improv_i:
             self.improv_i -= 1
             return action, self.improvise(x, action)
@@ -183,79 +187,90 @@ class ImprovisingAgent():
     def should_improvise(self, x, action):
         return np.random.rand() < self.improv_prob
 
+    def begin_improv(self): pass
+
     def improvise(self, x): raise NotImplemented
 
 
 class ImprovisingScript(ImprovisingAgent):
-    def __init__(self, improv_length=10, **kws):
-        super().__init__(bot_script, improv_length=improv_length, **kws)
-        self.mode = 0 # 0: start improvising, 1: opposite policy, 2: random choice of left / stright / right
-        self.turn = 0
-        self.boost = 0
+    def __init__(self, **kws):
+        super().__init__(bot_script, **kws)
+
+    def begin_improv(self):
+        self.turn = random.choice([-.8, -.4, 0, .4, .8])
+        self.boost = np.random.randint(2)
 
     def improvise(self, x, action):
         angle, boost = action[0], action[1]
-        if not self.mode:
-            self.mode = np.random.randint(1, 3)
-            if self.mode == 2:
-                self.turn = np.random.choice([-.8, -.4, 0, .4, .8]).item()
-                self.boost = np.random.randint(0, 2)
 
-        if self.mode == 1:
-            return angle + math.pi, not boost, 'opposite'
-        elif self.mode == 2:
-            heading = x[0][0][1]
-            return heading + self.turn, self.boost, 'random'
+        heading = x[0][0][1]
+        angle = heading + self.turn
+        print('IMPROV random', self.turn, angle)
+        return [heading + self.turn, self.boost, 'random']
 
 
-class Model(nn.Module):
+class LoadableModel(nn.Module):
     save_path = 'model.pt'
 
-    def load(self):
+    def load(self, path=None):
+        path = path if path else self.save_path
+        ep = 0
         try:
-            ckpt = torch.load(self.save_path, weights_only=True)
+            ckpt = torch.load(path, weights_only=True)
             self.load_state_dict(ckpt['model'])
             ep = ckpt.get('ep', 0)
-            print(f"{self.__class__.__name__}: resumed from {self.save_path} (ep={ep})")
+            print(f"{self.__class__.__name__}: resumed from {path} (ep={ep})", file=sys.stderr)
         except (FileNotFoundError, EOFError, RuntimeError):
-            print(f"{self.__class__.__name__}: no checkpoint at {self.save_path}, starting fresh")
+            print(f"{self.__class__.__name__}: no checkpoint at {path}, starting fresh", file=sys.stderr)
 
         self.eval()
-        return self
+        return ep
 
-#    def __init__(self, dropout=0):
-#        super().__init__()
-#        input = IN_DIM - 2
-#        embed     = 16
-#        self.head = nn.Sequential(
-#            nn.Linear(input, input * 2), nn.Tanh(),
-#            nn.Dropout(p=.3 * dropout),
-#            nn.Linear(input * 2, embed), nn.Tanh(),
-#            nn.Dropout(p=.1 * dropout),
-#            nn.Linear(embed, embed), nn.Tanh(),
-#            nn.Dropout(p=.1 * dropout),
-#            nn.Linear(embed, embed), nn.Tanh(),
-#            nn.Linear(embed, K_ANGLE_BINS + 1),
-#        )
-#
-#        # Zero-init fine columns so training warm-starts from core features only
-#        self.head[0].weight.data[:, FINE_INDICES] = 0
-#        # Identity-init MID_LAYERS so they start as pass-throughs to prevent over-fitting
-#        for i in MID_LAYERS:
-#            weights = self.head[i].weight
-#            nn.init.eye_(weights)
-#            weights.data += torch.randn_like(weights) * .01
-#            nn.init.zeros_(self.head[i].bias)
-#
-#    def forward(self, x):
-#        return self.head(x[..., 2:])
-#
-#    def act(self, x: np.ndarray):
-#        t = torch.from_numpy(x) if isinstance(x, np.ndarray) else x
-#        with torch.no_grad():
-#            pred  = self.forward(t)
-#        bins  = torch.linspace(0, 2 * np.pi, K_ANGLE_BINS + 1)[:-1]
-#        probs = torch.softmax(pred[..., :K_ANGLE_BINS], dim=-1)
-#        dir_x = (probs * bins.cos()).sum(dim=-1)
-#        dir_y = (probs * bins.sin()).sum(dim=-1)
-#        return float(np.atan2(dir_y.item(), dir_x.item())), pred[..., -1].clamp(-1, 1).item() > 0, pred
+
+class PolicyNet(LoadableModel):
+    save_path = 'policy.pt'
+    offsets = torch.linspace(0, 2 * np.pi, K_ANGLE_BINS + 1)[:-1]
+
+    def __init__(self, dropout=0):
+        super().__init__()
+        input = IN_DIM - 2
+        embed     = 16
+        self.head = nn.Sequential(
+            nn.Linear(input, input * 2), nn.Tanh(),
+            nn.Dropout(p=.3 * dropout),
+            nn.Linear(input * 2, embed), nn.Tanh(),
+            nn.Dropout(p=.1 * dropout),
+            nn.Linear(embed, embed), nn.Tanh(),
+            nn.Dropout(p=.1 * dropout),
+            nn.Linear(embed, embed), nn.Tanh(),
+            nn.Linear(embed, K_ANGLE_BINS + 1),
+        )
+
+        # Zero-init fine columns so training warm-starts from core features only
+        self.head[0].weight.data[:, FINE_INDICES] = 0
+        # Identity-init MID_LAYERS so they start as pass-throughs to prevent over-fitting
+        for i in MID_LAYERS:
+            weights = self.head[i].weight
+            nn.init.eye_(weights)
+            weights.data += torch.randn_like(weights) * .01
+            nn.init.zeros_(self.head[i].bias)
+
+        self._act_count = 0
+
+    def forward(self, x):
+        return self.head(x[..., 2:])
+
+    def act(self, state):
+        t = torch.from_numpy(get_flat(state))
+        with torch.no_grad():
+            pred = self.forward(t)
+        probs = torch.softmax(pred[..., :K_ANGLE_BINS], dim=-1)
+        bin_idx = torch.multinomial(probs, 1).item()
+        angle = float(self.offsets[bin_idx].item())
+        boost = int(torch.bernoulli(torch.sigmoid(pred[-1])).item())
+
+        self._act_count += 1
+        if self._act_count % 20 == 0:
+            print(f'[model] bin={bin_idx} angle={angle:.2f} boost={boost} p={probs[bin_idx]:.2f}')
+
+        return [angle, boost, pred.tolist()]

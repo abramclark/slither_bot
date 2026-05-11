@@ -17,7 +17,7 @@ import sys
 import numpy as np
 
 
-def label(gamma, death_value, no_growth=False, no_death=False, death_offset=3):
+def label(gamma, death_value, no_growth=False, no_death=False):
     episodes: list[list[tuple[int, float]]] = []
     episode:  list[tuple[int, float]]       = []
     n_skipped = 0
@@ -37,10 +37,10 @@ def label(gamma, death_value, no_growth=False, no_death=False, death_offset=3):
             if episode:
                 episodes.append(episode)
                 episode = []
-        elif isinstance(d, list) and len(d) == 4:
-            episode.append((line_idx, float(d[0][0][2])))  # me[0][2] = size
-        else:
-            n_skipped += 1
+        elif d != []:
+            (me, others, food, timestamp), action, improv = d
+            meta, segs = me
+            episode.append((line_idx, float(meta[2])))
         line_idx += 1
 
     trailing = len(episode)
@@ -66,13 +66,12 @@ def label(gamma, death_value, no_growth=False, no_death=False, death_offset=3):
     mean, std = float(alive_vals.mean()), float(alive_vals.std())
 
     # Pass 2: alive_norm (mean=1) + discounted death signal
-    # Frames within death_offset of the death marker are left as NaN.
     for episode in episodes:
         T = len(episode)
-        for t in range(T - death_offset):
+        for t in range(T):
             li, _ = episode[t]
             alive_norm = 0.0 if no_growth else (labels_alive[li] - mean) / (std + 1e-8) + 1.0
-            death_disc = 0.0 if no_death else death_value * (gamma ** (T - death_offset - 1 - t))
+            death_disc = 0.0 if no_death else death_value * (gamma ** (T - 1 - t))
             labels[li] = alive_norm + death_disc
 
     valid_mask = ~np.isnan(labels)
@@ -95,12 +94,12 @@ def label(gamma, death_value, no_growth=False, no_death=False, death_offset=3):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--gamma",        type=float, default=0.99)
-    p.add_argument("--death-value",  type=float, default=-20.0)
+    p.add_argument("--death-penalty",  type=float, default=-50.0)
     p.add_argument("--no-growth",    action="store_true")
     p.add_argument("--no-death",     action="store_true")
     p.add_argument("--death-offset", type=int, default=2)
     args = p.parse_args()
-    label(args.gamma, args.death_value, args.no_growth, args.no_death, args.death_offset)
+    label(args.gamma, args.death_penalty, args.no_growth, args.no_death)
 
 
 if __name__ == "__main__":
