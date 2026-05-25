@@ -21,7 +21,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from model import get_flat, IN_DIM, OWN_SEGMENTS_INDEX, FOOD_START_INDEX, FOOD_END_INDEX, DIRX_INDEX, HEADINGX_INDEX
+from environment import get_flat, IN_DIM, OWN_SEGMENTS_INDEX, FOOD_START_INDEX, FOOD_END_INDEX, DIRX_INDEX, HEADINGX_INDEX
 from value_model import ValueNet, FINE_INDICES, SAMPLE_COUNT
 import value_model as _vm1
 

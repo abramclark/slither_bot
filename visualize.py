@@ -19,7 +19,7 @@ matplotlib.use('QtAgg')
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 
-from model import (
+from environment import (
     AVOID_DIST, bot_script, get_flat,
     K_BIG_FOOD, K_SM_FOOD, K_FOOD, K_SNAKE, K_SEGMENTS,
     DIRX_INDEX, HEADINGX_INDEX,

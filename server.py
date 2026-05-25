@@ -12,7 +12,8 @@ import websockets
 from websockets.http11 import Response
 from websockets.datastructures import Headers
 
-from model import bot_script, ImprovisingScript, PolicyNet
+from environment import bot_script, ImprovisingScript
+from policy_model import PolicyNet
 from sac_model import SACNet
 
 #logging.getLogger("websockets.server").setLevel(logging.CRITICAL)
@@ -121,7 +122,7 @@ _iscript = ImprovisingScript()
 _policy = PolicyNet()
 _sac = SACNet()
 
-_mode = 'sac'
+_mode = 'script'
 modes = dict(
     script=lambda x: (bot_script(x), None),
     iscript=lambda x: _iscript.act(x),

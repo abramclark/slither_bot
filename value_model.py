@@ -2,9 +2,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from model import PolicyNet, ImprovisingAgent, get_flat
-from model import (AVOIDX_INDEX, DIRX_INDEX, BOOST_INDEX, FOOD_START_INDEX, HEADINGX_INDEX, IN_DIM,
-                   FOOD_END_INDEX, OWN_SEGMENTS_INDEX, ACTION_INDICES, CORE_INDICES)
+from environment import ImprovisingAgent, get_flat, LoadableModel
+from environment import (AVOIDX_INDEX, DIRX_INDEX, BOOST_INDEX, FOOD_START_INDEX, HEADINGX_INDEX, IN_DIM,
+                         FOOD_END_INDEX, OWN_SEGMENTS_INDEX, ACTION_INDICES, CORE_INDICES)
 
 SAMPLE_COUNT = 8
 ACTION_SCALAR   = 10
@@ -16,7 +16,7 @@ FINE_INDICES    = [i for i in range(IN_DIM) if i not in CORE_INDICES]
 def to_core(x): return x[..., CORE_INDICES]
 
 
-class ValueNet(PolicyNet):
+class ValueNet(LoadableModel):
     """Predicts V(t) = net_size_change - AVERAGE_VALUE * horizon - death_indicator."""
     save_path = "value.pt"
 

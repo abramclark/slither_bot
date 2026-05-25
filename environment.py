@@ -7,7 +7,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-K_ANGLE_BINS = 16  # discrete direction output bins
 K_BIG_FOOD = 10 # nearest big foods
 K_SM_FOOD = 5   # nearest small foods
 K_FOOD = K_BIG_FOOD + K_SM_FOOD
@@ -15,27 +14,26 @@ K_SNAKE = 4     # nearest snakes to use
 K_SEGMENTS = 3 # examine K_SEGMENTS of snakes
 META_SIZE = 6   # [turn_x, turn_y, heading_x * speed, heading_y * speed, speed, scale]
 FOOD_SIZE = K_FOOD * 2
+AVOID_DIST = 250
 
 IN_DIM = META_SIZE + FOOD_SIZE + K_SNAKE * K_SEGMENTS * 2 + K_SNAKE * META_SIZE + 4
 
-AVOID_DIST = 250
 DIRX_INDEX       = 0 # own_meta[(0,1)] = turn to x, y
 HEADINGX_INDEX   = 2 # own_meta[(2,3)] = moving towards x, y
 BOOST_INDEX      = 4 # own_meta[4] = is speed (.413 to 1)
 FOOD_START_INDEX = META_SIZE
 FOOD_END_INDEX = FOOD_START_INDEX + FOOD_SIZE
+FOOD_SM_INDEX = FOOD_START_INDEX + K_BIG_FOOD * 2
 AVOIDX_INDEX = FOOD_END_INDEX # nearest segment angle of nearest snake
 OWN_SEGMENTS_INDEX = IN_DIM - K_SEGMENTS * 2
 
 ACTION_INDICES  = [DIRX_INDEX, DIRX_INDEX + 1, BOOST_INDEX]
-FOOD_SM_INDEX = FOOD_START_INDEX + K_BIG_FOOD * 2
 CORE_INDICES    = [
     AVOIDX_INDEX, AVOIDX_INDEX + 1,
     OWN_SEGMENTS_INDEX, OWN_SEGMENTS_INDEX + 1 # first own segment is angle and distance to world edge
 ] + list(range(FOOD_START_INDEX, FOOD_END_INDEX))
 
 FINE_INDICES    = [i - 2 for i in range(2, IN_DIM) if i not in CORE_INDICES]
-MID_LAYERS = [6, 9]
 
 
 def parse_record(d):
@@ -142,7 +140,7 @@ def bot_script(state):
             boost = 1
 
     else:
-        # Seek closest food, preferring large one
+        # Seek closest food, preferring and boosting towards a large one
         best_dist = 1200
         best_sm_dist = 1200
         for f in food:
@@ -226,51 +224,5 @@ class LoadableModel(nn.Module):
         self.eval()
         return ep
 
-
-class PolicyNet(LoadableModel):
-    save_path = 'policy.pt'
-    offsets = torch.linspace(0, 2 * np.pi, K_ANGLE_BINS + 1)[:-1]
-
-    def __init__(self, dropout=0):
-        super().__init__()
-        input = IN_DIM - 2
-        embed     = 16
-        self.head = nn.Sequential(
-            nn.Linear(input, input * 2), nn.Tanh(),
-            nn.Dropout(p=.3 * dropout),
-            nn.Linear(input * 2, embed), nn.Tanh(),
-            nn.Dropout(p=.1 * dropout),
-            nn.Linear(embed, embed), nn.Tanh(),
-            nn.Dropout(p=.1 * dropout),
-            nn.Linear(embed, embed), nn.Tanh(),
-            nn.Linear(embed, K_ANGLE_BINS + 1),
-        )
-
-        # Zero-init fine columns so training warm-starts from core features only
-        self.head[0].weight.data[:, FINE_INDICES] = 0
-        # Identity-init MID_LAYERS so they start as pass-throughs to prevent over-fitting
-        for i in MID_LAYERS:
-            weights = self.head[i].weight
-            nn.init.eye_(weights)
-            weights.data += torch.randn_like(weights) * .01
-            nn.init.zeros_(self.head[i].bias)
-
-        self._act_count = 0
-
-    def forward(self, x):
-        return self.head(x[..., 2:])
-
-    def act(self, state):
-        t = torch.from_numpy(get_flat(state))
-        with torch.no_grad():
-            pred = self.forward(t)
-        probs = torch.softmax(pred[..., :K_ANGLE_BINS], dim=-1)
-        bin_idx = torch.multinomial(probs, 1).item()
-        angle = float(self.offsets[bin_idx].item())
-        boost = int(torch.bernoulli(torch.sigmoid(pred[-1])).item())
-
-        self._act_count += 1
-        if self._act_count % 20 == 0:
-            print(f'[model] bin={bin_idx} angle={angle:.2f} boost={boost} p={probs[bin_idx]:.2f}')
-
-        return [angle, boost, pred.tolist()]
+    def save(self, episodes):
+        torch.save({'model': self.state_dict(), 'ep': episodes}, self.save_path)

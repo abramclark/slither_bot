@@ -1,13 +1,17 @@
+import time
+
 import gymnasium as gym
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
+import torch.nn.functional as F
 
 from environment import LoadableModel
 
 
 class LanderNet(LoadableModel):
     save_path = 'lander.pt'
+    log4 = torch.log(torch.tensor(4))
 
     def __init__(self, dropout=0):
         super().__init__()
@@ -29,7 +33,7 @@ class LanderNet(LoadableModel):
         logits = self(torch.from_numpy(x))
         dist = Categorical(logits=logits)
         action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy()
+        return action, dist.log_prob(action), dist.entropy() - self.log4
 
     def act_max(self, x):
         return self(torch.from_numpy(x)).argmax().item()
@@ -58,7 +62,7 @@ def discount(rewards, gamma=.98):
     return returns
 
 
-def train(model, episodes=100, lr=1e-4, alpha=.01):
+def train(model, episodes=100, lr=1e-4, alpha=0.0):
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     env = gym.make('LunarLander-v3', render_mode=None)
 
@@ -68,52 +72,83 @@ def train(model, episodes=100, lr=1e-4, alpha=.01):
 
         returns = discount(rewards)
         returns = (returns - returns.mean()) / returns.std()
-        loss = -(returns * log_probs).sum() - (alpha * entropies).sum()
+        entropy = entropies.mean()
+        loss = -(returns * log_probs).sum() + alpha * entropy
         loss.backward()
         optimizer.step()
-        print(f'{i:4d}: {loss.item():6.1f} {sum(rewards):6.1f}')
+        print(f'{i:4d}: {loss.item():6.1f} {entropy.item():6.3f} {sum(rewards):6.1f}')
 
 
-def td_train(model, gamma=.98, episodes=100, lr=1e-4, batch_size=10):
+def td_train(model, gamma=.98, episodes=100, lr=1e-4, alpha=.05, copy_int=1000, epsilon=.5, stochastic=False, n_ahead=5):
+    old_model = model.__class__()
+    old_model.load_state_dict(model.state_dict())
+    old_model.requires_grad_(False)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     env = gym.make('LunarLander-v3', render_mode=None)
 
+    count = 0
     for i in range(episodes):
         steps = []
         with torch.no_grad():
-            for b in range(batch_size):
-                state, _ = env.reset()
-                while True:
-                    logits = model(torch.from_numpy(state))
-                    epsilon = max(0.05, 1.0 - i / episodes)
+            state, _ = env.reset()
+            while True:
+                logits = old_model(torch.from_numpy(state))
+                if stochastic:
+                    dist = Categorical(logits=logits)
+                    action = dist.sample()
+                else:
+                    #epsilon = max(0.01, .5 - i / (episodes * 2))
                     if torch.rand(1).item() < epsilon:
                         action = torch.tensor(env.action_space.sample())
                     else:
                         action = logits.argmax()
-                    # Stochastic policy sampling destroys training
-                    #dist = Categorical(logits=logits)
-                    #action = dist.sample()
 
-                    state2, reward, terminal, truncated, *_ = env.step(action.item())
-                    done = terminal or truncated
-                    steps.append((state, action, logits.max(), reward, done))
-                    state = state2
-                    if done: break
+                state2, reward, terminal, truncated, *_ = env.step(action.item())
+                steps.append((state, action, logits[action], reward, terminal, truncated))
+                state = state2
 
-        losses = []
-        last_i = len(steps) - 1
-        optimizer.zero_grad()
-        rixs = torch.randperm(len(steps))
-        for j in rixs:
-            state, action, action_val, reward, done = steps[j]
-            val = model(torch.from_numpy(state))[action]
-            next_val = val if done else steps[j + 1][2]
-            losses.append((reward + gamma * next_val - val) ** 2)
+                count += 1
+                if count >= copy_int:
+                    old_model.load_state_dict(model.state_dict())
+                    count = 0
 
-        loss = torch.stack(losses).mean()
-        loss.backward()
-        optimizer.step()
-        print(f'{i:4d}: {loss:6.2f}')
+                if terminal or truncated: break
+
+        td_errors = []
+        entropies = []
+        rewards = []
+        end = len(steps) - 1
+        #rixs = torch.randperm(len(steps))
+        for j in range(len(steps)):
+            state, action, action_val, reward, dead, truncated = steps[j]
+            rewards.append(reward)
+
+            optimizer.zero_grad()
+
+            logits = model(torch.from_numpy(state))
+            val = logits[action]
+
+            probs = F.softmax(logits, dim=-1)
+            entropy = -(probs * probs.log()).sum(dim=-1) - LanderNet.log4
+            entropies.append(entropy)
+
+            ahead = min(n_ahead, end - j)
+            if n_ahead == ahead:
+                target_val = steps[j + ahead][3] if steps[j + ahead][5] else steps[j + ahead][2]
+            else:
+                target_val = 0
+            for k in reversed(range(ahead)):
+                target_val = steps[j + k][3] + target_val * gamma
+            td_error = (target_val - val) ** 2
+            td_errors.append(td_error)
+
+            loss = td_error - entropy * alpha
+            loss.backward()
+            optimizer.step()
+
+        td_error = torch.stack(td_errors).mean()
+        entropy = torch.stack(entropies).mean()
+        print(f'{i:4d}: {loss:6.2f} {td_error:6.2f} {entropy:6.2f} {sum(rewards):6.1f}')
 
 
 def eval(model, n=20):
@@ -137,3 +172,25 @@ def eval(model, n=20):
     print(f'scores: avg={scores.mean():5.1f} max={scores.max():5.1f} min={scores.min():5.1f}')
     print(f'lengths: avg={lengths.mean():5.1f} max={lengths.max():5.1f} min={lengths.min():5.1f}')
     return scores.mean()
+
+
+def view(model, stochastic=False):
+    env = gym.make('LunarLander-v3', render_mode='human')
+    obs, _ = env.reset()
+    i = 0
+    while True:
+        logits = model(torch.from_numpy(obs))
+        if stochastic:
+            dist = Categorical(logits=logits)
+            action = dist.sample()
+        else:
+            action = logits.argmax()
+
+        obs, reward, terminal, trunc, *__ = env.step(action.item())
+        print(f'{i:3d} {reward:8.1f}   ', ' '.join(f'{n:5.2f}' for n in logits))
+        if terminal or trunc: break
+        i += 1
+
+    time.sleep(1)
+    env.close()
+

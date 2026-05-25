@@ -22,7 +22,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from model import get_flat, bot_script, PolicyNet, BOOST_INDEX, FINE_INDICES, OWN_SEGMENTS_INDEX, IN_DIM, K_ANGLE_BINS
+from environment import get_flat, bot_script, BOOST_INDEX, FINE_INDICES, OWN_SEGMENTS_INDEX, IN_DIM
+from policy_model import PolicyNet, K_ANGLE_BINS
 
 ANGLE_BINS = torch.linspace(0, 2 * math.pi, K_ANGLE_BINS + 1)[:-1]  # (K_ANGLE_BINS,)
 

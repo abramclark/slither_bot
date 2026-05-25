@@ -23,7 +23,7 @@ import tempfile
 
 import numpy as np
 
-from model import get_flat, AVOIDX_INDEX, AVOID_DIST
+from environment import get_flat, AVOIDX_INDEX, AVOID_DIST
 
 
 def filter(in_file, n, avoid_factor, tmp_dir='.'):

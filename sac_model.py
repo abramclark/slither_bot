@@ -2,8 +2,9 @@ import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 
-from model import get_flat, IN_DIM, LoadableModel, K_ANGLE_BINS, FINE_INDICES
+from environment import get_flat, IN_DIM, LoadableModel, FINE_INDICES
 
+K_ANGLE_BINS = 16
 MID_LAYERS = [4, 6]
 
 
