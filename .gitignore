@@ -2,9 +2,13 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
+
 *.jsonl
 *.pt
+*.pickle
+
 old_models/
 old_train/
 scratch.py
+
 .codex

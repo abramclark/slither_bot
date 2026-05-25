@@ -1,139 +1,139 @@
-import gymnasium as gym
-import torch
-import torch.nn as nn
-from torch.distributions import Categorical
+import pickle
 
-from environment import LoadableModel
+from flax import nnx
+import gymnasium
+import jax
+from jax import numpy as np
+import optax
 
-
-class LanderNet(LoadableModel):
-    save_path = 'lander.pt'
-
-    def __init__(self, dropout=0):
-        super().__init__()
-        input = 8
-        trans = 16
-        embed = 6
-        self.head = nn.Sequential(
-            nn.Linear(input, trans), nn.Tanh(),
-            nn.Linear(trans, trans), nn.Tanh(),
-            nn.Linear(trans, trans), nn.Tanh(),
-            nn.Linear(trans, trans), nn.Tanh(),
-            nn.Linear(trans, 4),
-        )
-
-    def forward(self, x):
-        return self.head(x)
-
-    def act(self, x):
-        logits = self(torch.from_numpy(x))
-        dist = Categorical(logits=logits)
-        action = dist.sample()
-        return action, dist.log_prob(action), dist.entropy()
-
-    def act_max(self, x):
-        return self(torch.from_numpy(x)).argmax().item()
+MAX = 1000
+EP_SHAPE = ((MAX, 8), (MAX,), (MAX,), (MAX, 4))
 
 
-def get_episode(env, model):
-    steps = []
-    obs, _ = env.reset()
+class LanderNet(nnx.Module):
+    def __init__(self, rngs=nnx.Rngs(0)):
+        wi = uniform(-0.45, 0.45)
+        self.layers = nnx.List([
+            nnx.Linear(8, 16, kernel_init=wi, rngs=rngs),
+            nnx.Linear(16, 16, kernel_init=wi, rngs=rngs),
+            nnx.Linear(16, 16, kernel_init=wi, rngs=rngs),
+            nnx.Linear(16, 16, kernel_init=wi, rngs=rngs),
+            nnx.Linear(16, 4, kernel_init=wi, rngs=rngs),
+        ])
 
+    def __call__(self, x: jax.Array) -> jax.Array:
+        for l in self.layers[:-1]:
+            x = jax.nn.tanh(l(x))
+        return self.layers[-1](x)
+
+    def act(self, x, stochastic, rk=jax.random.key(0)):
+        logits = self(x)
+        action = jax.random.categorical(rk, logits) if stochastic else logits.argmax()
+        return action, logits
+
+
+def loss(model, episode, gamma=.98):
+    states, actions, rewards, nograd_logits, n = episode
+    logits = jax.vmap(model)(states)
+    mask = np.arange(MAX) < n
+
+    returns = discount(rewards, gamma)
+    ret_mean = returns.sum() / n
+    ret_std = np.sqrt(((returns - ret_mean * mask) ** 2).sum() / n)
+    returns = ((returns - ret_mean) * mask) / ret_std
+
+    probs = nnx.softmax(logits)
+    log_probs = np.log(probs)
+    action_log_probs = log_probs[np.arange(MAX), actions.astype(np.int16)]
+
+    entropies = -(probs * log_probs).sum(axis=1) * mask
+    entropy_mean = entropies.sum() / n
+
+    val = -sum(returns * action_log_probs)
+
+    return val, (val, rewards.sum(), entropy_mean)
+
+def discount(rewards, gamma):
+    return jax.lax.scan(
+        lambda total, r: (v := r + total * gamma, v),
+        0.0, rewards, reverse=True
+    )[1]
+
+def batch_loss(model, batch, **kws):
+    vals, rewards, entropies = jax.vmap(lambda *ep: loss(model, ep, **kws)[1])(*batch)
+    val = vals.mean()
+    return val, (val, rewards.mean(), entropies.mean())
+
+@nnx.jit
+def learn(model, optimizer, batch, **loss_kws):
+    grad, aux = nnx.grad(batch_loss, has_aux=True, graph=False)(model, batch, **loss_kws)
+    optimizer.update(model, grad)
+    return aux
+
+
+def mc_train(model, rk=jax.random.key(0), episodes=100, lr=3e-3, batch_size=5, **loss_kws):
+    optimizer = nnx.Optimizer(model, optax.adabelief(learning_rate=lr), wrt=nnx.Param)
+    env = gymnasium.make('LunarLander-v3', render_mode=None)
+
+    for i in range(episodes):
+        episodes = []
+        for _ in range(batch_size):
+            rk, sk = jax.random.split(rk)
+            episodes.append(get_episode(env, model, stochastic=True, rk=sk))
+        batch = jax.tree.map(lambda *xs: np.stack(xs), *episodes)
+        loss_val, reward_sum, entropy_mean = learn(model, optimizer, batch, **loss_kws)
+        print(f'{i:4d}: {loss_val:6.1f} {entropy_mean:6.3f} {reward_sum:6.1f}')
+
+
+def get_episode(env, model, stochastic=True, rk=jax.random.key(0)):
+    states, actions, rewards, logits = (np.zeros(s) for s in EP_SHAPE)
+    state, _ = env.reset()
+
+    n = 0
     while True:
-        action, log_prob, entropy = model.act(obs)
-        obs, reward, terminal, truncated, *_ = env.step(action.item())
-        steps.append(torch.stack([torch.tensor(reward), log_prob, entropy]))
+        rk, sk = jax.random.split(rk)
+        action, y = model.act(state, stochastic, sk)
+
+        states = states.at[n].set(state)
+        actions = actions.at[n].set(action)
+        logits = logits.at[n].set(y)
+
+        state, reward, terminal, truncated, _ = env.step(action.item())
+        rewards = rewards.at[n].set(reward)
+
+        n += 1
         if terminal or truncated: break
 
-    return torch.stack(steps).transpose(0, 1)
+    return states, actions, rewards, logits, n
 
 
-def discount(rewards, gamma=.98):
-    T = len(rewards)
-    returns = torch.zeros(T)
-    total = 0
-    for i in reversed(range(T)):
-        total = rewards[i] + gamma * total
-        returns[i] = total
-    return returns
+def score(model, n=20):
+    env = gymnasium.make('LunarLander-v3', render_mode=None)
 
+    def run_ep():
+        _, _, rewards, _, n = get_episode(env, model, False)
+        score = rewards.sum()
+        print(score, n)
+        return score
 
-def train(model, episodes=100, lr=1e-4, alpha=.01):
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    env = gym.make('LunarLander-v3', render_mode=None)
-
-    for i in range(episodes):
-        optimizer.zero_grad()
-        rewards, log_probs, entropies = get_episode(env, model)
-
-        returns = discount(rewards)
-        returns = (returns - returns.mean()) / returns.std()
-        loss = -(returns * log_probs).sum() - (alpha * entropies).sum()
-        loss.backward()
-        optimizer.step()
-        print(f'{i:4d}: {loss.item():6.1f} {sum(rewards):6.1f}')
-
-
-def td_train(model, gamma=.98, episodes=100, lr=1e-4, batch_size=10):
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    env = gym.make('LunarLander-v3', render_mode=None)
-
-    for i in range(episodes):
-        steps = []
-        with torch.no_grad():
-            for b in range(batch_size):
-                state, _ = env.reset()
-                while True:
-                    logits = model(torch.from_numpy(state))
-                    epsilon = max(0.05, 1.0 - i / episodes)
-                    if torch.rand(1).item() < epsilon:
-                        action = torch.tensor(env.action_space.sample())
-                    else:
-                        action = logits.argmax()
-                    # Stochastic policy sampling destroys training
-                    #dist = Categorical(logits=logits)
-                    #action = dist.sample()
-
-                    state2, reward, terminal, truncated, *_ = env.step(action.item())
-                    done = terminal or truncated
-                    steps.append((state, action, logits.max(), reward, done))
-                    state = state2
-                    if done: break
-
-        losses = []
-        last_i = len(steps) - 1
-        optimizer.zero_grad()
-        rixs = torch.randperm(len(steps))
-        for j in rixs:
-            state, action, action_val, reward, done = steps[j]
-            val = model(torch.from_numpy(state))[action]
-            next_val = val if done else steps[j + 1][2]
-            losses.append((reward + gamma * next_val - val) ** 2)
-
-        loss = torch.stack(losses).mean()
-        loss.backward()
-        optimizer.step()
-        print(f'{i:4d}: {loss:6.2f}')
-
-
-def eval(model, n=20):
-    scores = torch.zeros(n)
-    lengths = torch.zeros(n)
-    env = gym.make('LunarLander-v3', render_mode=None)
-
-    for i in range(n):
-        obs, _ = env.reset()
-        rewards = []
-        while True:
-            action = model.act_max(obs)
-            obs, reward, terminal, trunc, *__ = env.step(action)
-            rewards.append(reward)
-            if terminal or trunc: break
-        total = sum(rewards)
-        print(total, len(rewards))
-        scores[i] = total
-        lengths[i] = len(rewards)
-
-    print(f'scores: avg={scores.mean():5.1f} max={scores.max():5.1f} min={scores.min():5.1f}')
-    print(f'lengths: avg={lengths.mean():5.1f} max={lengths.max():5.1f} min={lengths.min():5.1f}')
+    scores = np.array([run_ep() for i in range(n)])
     return scores.mean()
+
+
+def uniform(low, high):
+  return lambda key, shape, dtype: jax.random.uniform(key, shape, dtype, low, high)
+
+
+def entropy(a):
+    probs = nnx.softmax(a)
+    return -(probs * np.log(probs)).sum()
+
+
+def save(model, path='lander.pickle'):
+    state = nnx.to_pure_dict(nnx.split(model)[1])
+    pickle.dump(state, open(path, 'wb'))
+
+def load(model, path='lander.pickle'):
+    gdef, state = nnx.split(model)
+    nnx.replace_by_pure_dict(state, pickle.load(open(path, 'rb')))
+    return nnx.merge(gdef, state)
