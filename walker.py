@@ -7,22 +7,24 @@ from jax import numpy as np
 import optax
 
 MAX = 1000
-EP_SHAPE = ((MAX, 8), (MAX,), (MAX,), (MAX, 4))
-GYM_ENV = 'LunarLander-v3'
+EP_SHAPE = ((MAX, 24), (MAX, 4), (MAX,), (MAX, 8))
 
 
 class PolicyCritic(nnx.Module):
-    def __init__(self, input=8, trans=16, hidden=3, output=4, rngs=nnx.Rngs(0)):
-        self.policy = mlp(input, trans, hidden, output, rngs)
+    def __init__(self, input=24, trans=48, hidden=3, output=4, rngs=nnx.Rngs(0)):
+        self.policy = mlp(input, trans, hidden, output * 2, rngs)
         self.value  = mlp(input, trans, hidden, 1,          rngs)
 
     def __call__(self, x): return infer(self.policy, x)
     def critic(self, x): return infer(self.value, x)
 
     def act(self, x, stochastic, rk=jax.random.key(0)):
-        logits = self(x)
-        action = jax.random.categorical(rk, logits) if stochastic else logits.argmax()
-        return action, logits
+        out = self(x)
+        d = out.shape[-1] // 2
+        mu, log_sigma = out[:d], np.clip(out[d:], -4, 2)
+        sigma = np.exp(log_sigma)
+        noise = jax.random.normal(rk, mu.shape) * sigma if stochastic else 0.0
+        return jax.nn.tanh(mu + noise), out
 
 def infer(mlp, x):
     for l in mlp[:-1]:
@@ -40,7 +42,10 @@ def mlp(input, trans, hidden, output, rngs):
 
 def loss(model, episode, gamma=.98, critic=True):
     states, actions, rewards, nograd_logits, n = episode
-    logits = jax.vmap(model)(states)
+    out = jax.vmap(model)(states)
+    d = out.shape[-1] // 2
+    mu, log_sigma = out[:, :d], np.clip(out[:, d:], -4, 2)
+    sigma = np.exp(log_sigma)
     mask = np.arange(MAX) < n
 
     returns = discount(rewards, gamma)
@@ -48,11 +53,13 @@ def loss(model, episode, gamma=.98, critic=True):
     ret_std = np.sqrt(((returns - ret_mean * mask) ** 2).sum() / n)
     returns = ((returns - ret_mean) * mask) / ret_std
 
-    probs = nnx.softmax(logits)
-    log_probs = np.log(probs)
-    action_log_probs = log_probs[np.arange(MAX), actions.astype(np.int16)]
+    raw = np.arctanh(np.clip(actions, -1 + 1e-6, 1 - 1e-6))
+    action_log_probs = (
+        -0.5 * ((raw - mu) / sigma) ** 2 - log_sigma
+        - np.log(1 - actions ** 2 + 1e-6)
+    ).sum(axis=1) * mask
 
-    entropies = -(probs * log_probs).sum(axis=1) * mask
+    entropies = (log_sigma + 0.5 * np.log(2 * np.pi * np.e)).sum(axis=1) * mask
     entropy_mean = entropies.sum() / n
 
     val = returns * action_log_probs
@@ -108,7 +115,7 @@ def learn(model, optimizer, batch, **loss_kws):
 def mc_train(model, episodes=100, lr=3e-3, critic_lr=3e-2, batch_size=5, rk=jax.random.key(0), critic=True, policy=True, **loss_kws):
     optimizer = nnx.Optimizer(model, optax.adabelief(learning_rate=lr), wrt=nnx.Param)
     critic_optimizer = nnx.Optimizer(model, optax.adabelief(learning_rate=critic_lr), wrt=nnx.Param)
-    env = gymnasium.make(GYM_ENV, render_mode=None)
+    env = gymnasium.make('BipedalWalker-v3', render_mode=None)
 
     print(f'ep: loss entropy critic_loss reward_sum')
     for i in range(episodes):
@@ -143,7 +150,7 @@ def get_episode(env, model, stochastic=True, rk=jax.random.key(0)):
         actions = actions.at[n].set(action)
         logits = logits.at[n].set(y)
 
-        state, reward, terminal, truncated, _ = env.step(action.item())
+        state, reward, terminal, truncated, _ = env.step(action)
         rewards = rewards.at[n].set(reward)
 
         n += 1
@@ -160,7 +167,7 @@ def get_batch(env, model, batch_size, rk, stochastic=True):
 
 
 def score(model, n=20):
-    env = gymnasium.make(GYM_ENV, render_mode=None)
+    env = gymnasium.make('BipedalWalker-v3', render_mode=None)
 
     def run_ep():
         _, _, rewards, _, n = get_episode(env, model, False)
