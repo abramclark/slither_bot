@@ -44,9 +44,7 @@ def loss(model, episode, gamma=.98, critic=True):
     mask = np.arange(MAX) < n
 
     returns = discount(rewards, gamma)
-    ret_mean = returns.sum() / n
-    ret_std = np.sqrt(((returns - ret_mean * mask) ** 2).sum() / n)
-    returns = ((returns - ret_mean) * mask) / ret_std
+    returns = normalize(returns, n)
 
     probs = nnx.softmax(logits)
     log_probs = np.log(probs)
@@ -58,9 +56,7 @@ def loss(model, episode, gamma=.98, critic=True):
     val = returns * action_log_probs
     if critic:
         criticisms = jax.vmap(model.critic)(states).squeeze() * mask
-        critic_mean = criticisms.sum() / n
-        critic_std = np.sqrt(((returns - ret_mean * mask) ** 2).sum() / n)
-        criticisms = ((criticisms - critic_mean) * mask) / critic_std
+        criticisms = normalize(criticisms, n)
         val = val - criticisms
     val = -sum(val)
 
@@ -83,9 +79,7 @@ def critic_loss(model, episode, gamma=.98, critic=1):
     vals = jax.vmap(model.critic)(states).squeeze() * mask
 
     returns = discount(rewards, gamma)
-    ret_mean = returns.sum() / n
-    ret_std = np.sqrt(((returns - ret_mean * mask) ** 2).sum() / n)
-    returns = ((returns - ret_mean) * mask) / ret_std
+    returns = normalize(returns, n)
 
     return ((returns - vals) ** 2).mean()
 
@@ -120,8 +114,8 @@ def mc_train(model, episodes=100, lr=3e-3, critic_lr=3e-2, batch_size=5, rk=jax.
 
         print(f'{i:4d}: {loss_val:6.1f} {entropy_mean:6.3f} {critic_loss:6.3f} {reward_sum:6.1f}')
 
-        if critic:
-            while critic_loss > 0.5:
+        if critic and critic_loss > 2.0:
+            while critic_loss > 1.0:
                 rk, sk = jax.random.split(rk)
                 batch = get_batch(env, model, batch_size, sk, stochastic=True)
                 critic_loss = critic_learn(model, critic_optimizer, batch, **loss_kws)
@@ -158,7 +152,6 @@ def get_batch(env, model, batch_size, rk, stochastic=True):
         episodes.append(get_episode(env, model, stochastic=stochastic, rk=sk))
     return jax.tree.map(lambda *xs: np.stack(xs), *episodes)
 
-
 def score(model, n=20):
     env = gymnasium.make(GYM_ENV, render_mode=None)
 
@@ -175,10 +168,15 @@ def score(model, n=20):
 def uniform(low, high):
   return lambda key, shape, dtype: jax.random.uniform(key, shape, dtype, low, high)
 
-
 def entropy(a):
     probs = nnx.softmax(a)
     return -(probs * np.log(probs)).sum()
+
+def normalize(vec, n):
+    mask = np.arange(MAX) < n
+    mean = vec.sum() / n
+    std = np.sqrt(((vec - mean * mask) ** 2).sum() / n)
+    return ((vec - mean) * mask) / std
 
 
 def save(model, path='lander.pickle'):
